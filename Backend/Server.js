@@ -11,7 +11,7 @@ const XLSX = require('xlsx');
 require('dotenv').config();
 const crypto = require('crypto');
 
-const { scrapeGoogleMapsLeads } = require('./Scraper');
+const { scrapeGoogleMapsLeads } = require('./scraper');
 const NodeCache = require('node-cache');
 const msgRetryCounterCache = new NodeCache();
 const subscriptionRequestRoutes = require('./routes/subscriptionRequestRoutes');
@@ -33,6 +33,9 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 app.use('/api/subscription-requests', subscriptionRequestRoutes);
+
+const socialExtractorRoutes = require('./routes/socialExtractor');
+app.use('/api/social-extractor', socialExtractorRoutes);
 
 // Web Scraper API Endpoint
 app.post("/api/scrape-leads", async (req, res) => {
