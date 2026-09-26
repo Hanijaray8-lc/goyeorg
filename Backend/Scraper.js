@@ -119,6 +119,9 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--no-zygote",
         "--window-size=1280,900"
       ]
     });
@@ -172,8 +175,8 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     let scrollingDone = false;
 
     // ── Concurrent phone extraction worker ──────────────────────────────────
-    // Runs in background while scrolling continues; 4 tabs at a time.
-    const PHONE_CONCURRENCY = 4;
+    // Runs in background while scrolling continues; 2 tabs at a time for stable cloud hosting memory.
+    const PHONE_CONCURRENCY = 2;
     const phoneWorkerPromise = (async () => {
       while (!scrollingDone || phoneQueue.length > 0) {
         if (phoneQueue.length === 0) {
