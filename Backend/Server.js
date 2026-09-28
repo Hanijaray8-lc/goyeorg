@@ -11,7 +11,7 @@ const XLSX = require('xlsx');
 require('dotenv').config();
 const crypto = require('crypto');
 
-const { scrapeGoogleMapsLeads } = require('./scraper');
+const { scrapeGoogleMapsLeads } = require('./Scraper');
 const NodeCache = require('node-cache');
 const msgRetryCounterCache = new NodeCache();
 const subscriptionRequestRoutes = require('./routes/subscriptionRequestRoutes');
