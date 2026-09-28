@@ -11,7 +11,7 @@ const XLSX = require('xlsx');
 require('dotenv').config();
 const crypto = require('crypto');
 
-const { scrapeGoogleMapsLeads } = require('./Scraper');
+const { scrapeGoogleMapsLeads } = require('./scraper');
 const NodeCache = require('node-cache');
 const msgRetryCounterCache = new NodeCache();
 const subscriptionRequestRoutes = require('./routes/subscriptionRequestRoutes');
@@ -96,6 +96,15 @@ const messageHistorySchema = new mongoose.Schema({
 });
 
 const MessageHistory = mongoose.models.MessageHistory || mongoose.model('MessageHistory', messageHistorySchema);
+
+// WhatsApp Contacts Persistent Schema (MongoDB Atlas storage so contacts never get lost on server restart)
+const whatsappContactSchema = new mongoose.Schema({
+  email: { type: String, required: true, index: true },
+  contacts: { type: Object, default: {} },
+  contactNames: { type: Object, default: {} },
+  updatedAt: { type: Date, default: Date.now }
+});
+const WhatsAppContact = mongoose.models.WhatsAppContact || mongoose.model('WhatsAppContact', whatsappContactSchema);
 
 // --- WhatsApp Logic Setup (User-Specific) ---
 const userClients = {}; // key: email, value: { whatsappClient, latestQR, isWhatsAppAuthenticated }
@@ -274,10 +283,23 @@ async function getGroupsForUser(userClient, { forceRefresh = false } = {}) {
     return userClient.groupsFetchInFlight;
 }
 
-async function getContactsForUser(userClient) {
+async function getContactsForUser(userClient, userEmail = "") {
     if (!userClient) return [];
     if (!userClient.contactsMap) userClient.contactsMap = {};
     
+    // Attempt database restore if memory cache has very few contacts
+    if (userEmail && Object.keys(userClient.contactsMap).length < 5) {
+        try {
+            const record = await WhatsAppContact.findOne({ email: userEmail.toLowerCase() });
+            if (record && record.contacts && typeof record.contacts === "object") {
+                userClient.contactsMap = { ...(record.contacts || {}), ...(userClient.contactsMap || {}) };
+                if (record.contactNames && typeof record.contactNames === "object") {
+                    userClient.contactNames = { ...(record.contactNames || {}), ...(userClient.contactNames || {}) };
+                }
+            }
+        } catch (_) {}
+    }
+
     try {
         await getGroupsForUser(userClient);
     } catch (e) {
@@ -291,15 +313,22 @@ async function getContactsForUser(userClient) {
             if (Array.isArray(group.participants)) {
                 group.participants.forEach(p => {
                     if (p && p.id) {
-                        const jid = p.id.endsWith('@lid') ? (p.phoneNumber ? `${p.phoneNumber}@s.whatsapp.net` : p.id) : p.id;
-                        if (jid.endsWith('@s.whatsapp.net') && !userClient.contactsMap[jid]) {
-                            const rawNumber = jid.split('@')[0].replace(/\D/g, '');
-                            if (rawNumber && rawNumber.length >= 7 && rawNumber.length <= 15) {
+                        const rawId = p.id;
+                        let effectiveNumber = null;
+                        if (rawId.endsWith('@s.whatsapp.net')) {
+                            effectiveNumber = rawId.split('@')[0].replace(/\D/g, '');
+                        } else if (p.phoneNumber) {
+                            effectiveNumber = String(p.phoneNumber).replace(/\D/g, '');
+                        }
+                        
+                        if (effectiveNumber && effectiveNumber.length >= 7 && effectiveNumber.length <= 15) {
+                            const jid = `${effectiveNumber}@s.whatsapp.net`;
+                            if (!userClient.contactsMap[jid]) {
                                 userClient.contactsMap[jid] = {
                                     id: jid,
-                                    name: `+${rawNumber}`,
+                                    name: `+${effectiveNumber}`,
                                     notify: '',
-                                    number: rawNumber,
+                                    number: effectiveNumber,
                                     isBusiness: false,
                                     isSavedContact: false
                                 };
@@ -311,7 +340,9 @@ async function getContactsForUser(userClient) {
             }
         });
     }
-    console.log(`[getContactsForUser] Extracted ${extractedCount} contacts from groups.`);
+    if (extractedCount > 0) {
+        console.log(`[getContactsForUser] Extracted ${extractedCount} contacts from groups.`);
+    }
 
     const contactsMap = userClient.contactsMap;
     const contactNames = userClient.contactNames || {};
@@ -338,6 +369,7 @@ async function getContactsForUser(userClient) {
         c.number.length <= 15 && 
         !c.id.includes('@g.us') && 
         !c.id.includes('@broadcast') &&
+        !c.id.includes('@lid') &&       
         !c.id.includes('status')
     );
 
@@ -349,15 +381,33 @@ async function getContactsForUser(userClient) {
     });
 }
 
-function saveContactsToDisk(email, folderName) {
+async function saveContactsToDisk(email, folderName) {
     try {
         if (!userClients[email] || !userClients[email].contactsMap) return;
         const filePath = path.join(__dirname, folderName, "contacts.json");
         fs.writeFileSync(filePath, JSON.stringify(userClients[email].contactsMap, null, 2), "utf8");
     } catch (_) {}
+
+    // Persistent MongoDB Atlas backup (Survives Render server restarts/deploys)
+    try {
+        if (email && userClients[email]?.contactsMap && Object.keys(userClients[email].contactsMap).length > 0) {
+            await WhatsAppContact.findOneAndUpdate(
+                { email: email.toLowerCase() },
+                {
+                    email: email.toLowerCase(),
+                    contacts: userClients[email].contactsMap,
+                    contactNames: userClients[email].contactNames || {},
+                    updatedAt: new Date()
+                },
+                { upsert: true, new: true }
+            );
+        }
+    } catch (dbErr) {
+        console.warn(`[saveContactsToDisk] MongoDB sync warning for ${email}:`, dbErr.message);
+    }
 }
 
-function loadContactsFromDisk(email, folderName) {
+async function loadContactsFromDisk(email, folderName) {
     try {
         const filePath = path.join(__dirname, folderName, "contacts.json");
         if (fs.existsSync(filePath)) {
@@ -373,6 +423,23 @@ function loadContactsFromDisk(email, folderName) {
             }
         }
     } catch (_) {}
+
+    // Load from MongoDB Atlas if disk cache was wiped by server restart/deploy
+    try {
+        if (email) {
+            const record = await WhatsAppContact.findOne({ email: email.toLowerCase() });
+            if (record && record.contacts && typeof record.contacts === "object") {
+                if (!userClients[email]) userClients[email] = {};
+                userClients[email].contactsMap = { ...(record.contacts || {}), ...(userClients[email].contactsMap || {}) };
+                if (record.contactNames && typeof record.contactNames === "object") {
+                    userClients[email].contactNames = { ...(record.contactNames || {}), ...(userClients[email].contactNames || {}) };
+                }
+                console.log(`✅ [MongoDB] Restored ${Object.keys(userClients[email].contactsMap).length} contacts for ${email}`);
+            }
+        }
+    } catch (dbErr) {
+        console.warn(`[loadContactsFromDisk] MongoDB load warning for ${email}:`, dbErr.message);
+    }
 }
 
 async function startWhatsAppForUser(email) {
@@ -394,7 +461,7 @@ async function startWhatsAppForUser(email) {
 
     try {
         const folderName = `auth_info_${email.replace(/[^a-zA-Z0-9]/g, '_')}`;
-        loadContactsFromDisk(email, folderName);
+        await loadContactsFromDisk(email, folderName);
 
         const { state, saveCreds } = await useMultiFileAuthState(folderName);
         const { version } = await fetchLatestBaileysVersion();
@@ -1155,7 +1222,7 @@ io.on("connection", (socket) => {
                 console.warn(`[get_contacts] Could not pre-fetch groups for contact extraction:`, groupErr.message);
             }
 
-            const contactsList = await getContactsForUser(userClient);
+            const contactsList = await getContactsForUser(userClient, email);
             console.log(`📋 [get_contacts] Contacts found for ${email}: ${contactsList.length}`);
             socket.emit("contacts_list", { success: true, contacts: contactsList });
         } catch (err) {
@@ -3088,7 +3155,7 @@ app.get('/api/contacts', async (req, res) => {
         if (!userClient || !userClient.isWhatsAppAuthenticated || !userClient.whatsappClient) {
             return res.status(503).json({ success: false, message: "WhatsApp is not connected." });
         }
-        const contactsList = await getContactsForUser(userClient);
+        const contactsList = await getContactsForUser(userClient, email);
         return res.status(200).json({ success: true, contacts: contactsList });
     } catch (err) {
         console.error('❌ GET /api/contacts error:', err);
