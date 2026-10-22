@@ -39,6 +39,11 @@ const freeUserSchema = new mongoose.Schema(
     location: { type: String, required: true, trim: true },
     role: { type: String, default: 'free_user' },
     status: { type: String, default: 'active' }, // 'active' | 'suspended'
+    credits: { type: Number, default: 30 },
+    freeCredits: { type: Number, default: 30 },
+    totalSent: { type: Number, default: 0 },
+    lastDailyRewardDate: { type: String, default: '' },
+    hasEverSubscribed: { type: Boolean, default: false },
   },
   { timestamps: true } // adds createdAt / updatedAt automatically
 );
@@ -64,6 +69,8 @@ function publicFreeUser(doc) {
     location: doc.location,
     role: doc.role,
     status: doc.status,
+    credits: doc.credits !== undefined ? doc.credits : 30,
+    totalSent: doc.totalSent !== undefined ? doc.totalSent : 0,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -133,6 +140,10 @@ router.post('/free-user/register', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
+    const d = new Date();
+    const offset = d.getTimezoneOffset() * 60000;
+    const today = new Date(d.getTime() - offset).toISOString().split('T')[0];
+
     const freeUser = new FreeUser({
       name: String(name).trim(),
       email: normalizedEmail,
@@ -141,6 +152,10 @@ router.post('/free-user/register', async (req, res) => {
       businessType: String(businessType || '').trim(),
       phone: String(phone).trim(),
       location: String(location).trim(),
+      credits: 30,
+      freeCredits: 30,
+      totalSent: 0,
+      lastDailyRewardDate: today,
     });
 
     await freeUser.save();
@@ -170,18 +185,154 @@ router.post('/free-user/login', async (req, res) => {
     }
 
     const normalizedEmail = String(email).trim().toLowerCase();
-    const freeUser = await FreeUser.findOne({ email: normalizedEmail });
+    const safeEmailRegex = new RegExp(`^${normalizedEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+
+    let freeUser = await FreeUser.findOne({ email: safeEmailRegex });
+    const User = mongoose.models.User;
+    let subUser = null;
+    if (User) {
+      try {
+        subUser = await User.findOne({ email: safeEmailRegex });
+      } catch (err) {
+        console.warn('⚠️ User collection lookup warning:', err.message);
+      }
+    }
+
+    // 1. If not found in FreeUser collection, check if they exist in Subscribed User collection!
     if (!freeUser) {
-      return res.status(401).json({ message: 'Invalid email or password.' });
+      if (!subUser) {
+        return res.status(401).json({ message: 'Invalid email or password.' });
+      }
+
+      // Check password against Subscribed user's credentials
+      const inputPass = String(password).trim();
+      const storedPass = subUser.password || subUser.passwordHash || '';
+      let isMatch = (storedPass === inputPass);
+      if (!isMatch && storedPass) {
+        try {
+          isMatch = await bcrypt.compare(inputPass, storedPass);
+        } catch (_) {}
+      }
+
+      if (!isMatch) {
+        return res.status(401).json({ message: 'Invalid email or password.' });
+      }
+
+      // First-time user logging into Free Portal gets 30 welcome trial credits
+      const assignedCredits = 30;
+
+      const passwordHash = (storedPass.startsWith('$2b$') || storedPass.startsWith('$2a$'))
+        ? storedPass
+        : await bcrypt.hash(inputPass, 10);
+
+      const d = new Date();
+      const offset = d.getTimezoneOffset() * 60000;
+      const today = new Date(d.getTime() - offset).toISOString().split('T')[0];
+
+      // Auto-bridge and create FreeUser record so they can use Free Portal seamlessly
+      freeUser = new FreeUser({
+        name: subUser.name || 'User',
+        email: normalizedEmail,
+        passwordHash,
+        businessName: subUser.businessName || '',
+        businessType: subUser.businessType || '',
+        phone: subUser.phone || '',
+        location: subUser.location || '',
+        credits: assignedCredits,
+        freeCredits: assignedCredits,
+        totalSent: subUser.totalSent || 0,
+        lastDailyRewardDate: today,
+        status: subUser.status === 'blocked' || subUser.status === 'suspended' ? 'suspended' : 'active',
+      });
+
+      await freeUser.save();
+      console.log(`✅ Auto-bridged Subscribed user "${normalizedEmail}" to FreeUser collection (credits: ${assignedCredits}).`);
+    } else {
+      // 2. FreeUser already exists — verify password
+      const inputPass = String(password).trim();
+      let isMatch = false;
+      if (freeUser.passwordHash) {
+        try {
+          isMatch = await bcrypt.compare(inputPass, freeUser.passwordHash);
+        } catch (_) {}
+        if (!isMatch && freeUser.passwordHash === inputPass) {
+          isMatch = true;
+        }
+      }
+
+      // Fallback: in case user updated password on Subscribed portal
+      if (!isMatch && subUser) {
+        const storedPass = subUser.password || subUser.passwordHash || '';
+        let isSubMatch = (storedPass === inputPass);
+        if (!isSubMatch && storedPass) {
+          try {
+            isSubMatch = await bcrypt.compare(inputPass, storedPass);
+          } catch (_) {}
+        }
+        if (isSubMatch) {
+          isMatch = true;
+          // Sync updated password hash into freeUser record
+          try {
+            freeUser.passwordHash = await bcrypt.hash(inputPass, 10);
+            await freeUser.save();
+          } catch (_) {}
+        }
+      }
+
+      if (!isMatch) {
+        return res.status(401).json({ message: 'Invalid email or password.' });
+      }
     }
 
     if (freeUser.status !== 'active') {
       return res.status(403).json({ message: 'This account is not active. Please contact support.' });
     }
 
-    const isMatch = await bcrypt.compare(password, freeUser.passwordHash);
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid email or password.' });
+    // STRICT GATEKEEPER:
+    // Once a user has subscribed to ANY plan (current or expired), they are a Subscribed User!
+    // They are strictly barred from using the Free User portal.
+    const hasSubHistory = !!(
+      (subUser && (subUser.hasEverSubscribed || subUser.subscriptionPlan || subUser.subscriptionStartedAt || subUser.isSubscribed)) ||
+      (freeUser && (freeUser.hasEverSubscribed || freeUser.subscriptionPlan || freeUser.subscriptionStartedAt || freeUser.isSubscribed))
+    );
+
+    if (hasSubHistory) {
+      const detectedName = (subUser && subUser.name) || (freeUser && freeUser.name) || '';
+      return res.status(403).json({
+        isUpgradedUser: true,
+        name: detectedName,
+        username: detectedName,
+        message: 'You have upgraded to a Premium Subscribed account! Free User portal is only for new trial users. Please log in through the Subscribed Portal.',
+        redirectUrl: '/userlogin'
+      });
+    }
+
+    // Daily Credit & Expired Subscription Refill Guard:
+    // If user's subscription in subUser or freeUser is expired (or non-existent),
+    // ensure they receive their daily 10 credits and never stay at 0 on login.
+    const d = new Date();
+    const offset = d.getTimezoneOffset() * 60000;
+    const today = new Date(d.getTime() - offset).toISOString().split('T')[0];
+
+    const isSubActive = !!(
+      (freeUser.subscriptionExpiresAt && new Date(freeUser.subscriptionExpiresAt).getTime() > Date.now()) ||
+      (subUser && subUser.subscriptionExpiresAt && new Date(subUser.subscriptionExpiresAt).getTime() > Date.now())
+    );
+
+    if (!isSubActive) {
+      let needsSave = false;
+      // If midnight has passed (new day) OR credits is 0 on login:
+      if (freeUser.lastDailyRewardDate !== today || !freeUser.credits || freeUser.credits <= 0) {
+        freeUser.credits = 10;
+        freeUser.freeCredits = 10;
+        freeUser.isSubscribed = false;
+        freeUser.lastDailyRewardDate = today;
+        needsSave = true;
+      }
+      if (needsSave) {
+        await freeUser.save();
+        console.log(`✅ Daily 10 credits refilled for FreeUser "${normalizedEmail}" on login.`);
+      }
     }
 
     const token = signToken(freeUser);
@@ -226,7 +377,7 @@ router.get('/free-user/me', requireFreeUserAuth, async (req, res) => {
 // middleware once I see how AdminLogin/AdminSidebar currently work.
 router.get('/admin/free-users', async (req, res) => {
   try {
-    const freeUsers = await FreeUser.find({}, '-passwordHash').sort({ createdAt: -1 }).lean();
+    const freeUsers = await FreeUser.find({}).sort({ createdAt: -1 }).lean();
     return res.status(200).json(freeUsers);
   } catch (error) {
     console.error('❌ Admin free-users list error:', error);

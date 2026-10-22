@@ -1,25 +1,69 @@
 const { chromium } = require("playwright");
+const { extractPhoneFromWebsite } = require("./utils/socialLinkExtractor");
 
-// ── Helper: fetch mobile-only phone from a listing detail page ──────────────
-async function fetchMobilePhone(context, listingUrl) {
+// ── Helper: fetch phone and website from a listing detail page ──────────────
+async function fetchMobilePhone(context, listingUrl, fallbackWebsite = null) {
   const detailPage = await context.newPage();
   try {
     await detailPage.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
     let rawPhone = null;
+    let website = fallbackWebsite;
+
     try {
-      await detailPage.waitForSelector('a[href^="tel:"]', { timeout: 4000 });
-      rawPhone = await detailPage.evaluate(() => {
-        const tel = document.querySelector('a[href^="tel:"]');
-        return tel ? tel.getAttribute("href").replace("tel:", "").trim() : null;
-      });
+      await detailPage.waitForSelector('button[data-item-id^="phone:"], button[aria-label*="Phone"], a[href^="tel:"], a[data-item-id="authority"]', { timeout: 3500 });
     } catch (_) {}
+
+    const extracted = await detailPage.evaluate(() => {
+      // 1. Phone button with data-item-id or aria-label
+      const phoneBtn = document.querySelector('button[data-item-id^="phone:"], button[aria-label*="Phone"], button[data-tooltip*="phone"], a[href^="tel:"]');
+      let phone = null;
+      if (phoneBtn) {
+        const itemId = phoneBtn.getAttribute("data-item-id") || "";
+        if (itemId.includes("phone:")) {
+          phone = itemId.replace("phone:tel:", "").replace("phone:", "").trim();
+        } else {
+          const aria = phoneBtn.getAttribute("aria-label") || "";
+          const m = aria.match(/Phone:\s*([^\n]+)/i);
+          if (m) phone = m[1].trim();
+          else if (phoneBtn.getAttribute("href")) {
+            phone = phoneBtn.getAttribute("href").replace("tel:", "").trim();
+          }
+        }
+      }
+
+      // 2. Regex search on detail text
+      if (!phone) {
+        const text = document.body ? document.body.innerText : "";
+        const m = text.match(/(?:\+?91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b|\b0\d{2,4}[\s\-]?\d{6,8}\b/);
+        if (m) phone = m[0].trim();
+      }
+
+      // 3. Website link
+      const webEl = document.querySelector('a[data-item-id="authority"], a[aria-label*="Website:"], a[data-tooltip="Open website"]');
+      const webUrl = webEl ? webEl.href : null;
+
+      return { phone, website: webUrl };
+    });
+
+    rawPhone = extracted.phone;
+    if (extracted.website) website = extracted.website;
+
     if (rawPhone) {
-      const raw = rawPhone.replace(/[\s\-\.]/g, ""); // strip spaces/dashes only
-      if (raw.length >= 6) return rawPhone.trim();   // return as-is from Google Maps
+      const raw = rawPhone.replace(/[\s\-\.]/g, "");
+      if (raw.length >= 6) return { phone: rawPhone.trim(), website };
     }
-    return null;
+
+    // 4. Secondary fallback: scan the business website for phone number!
+    if (website) {
+      try {
+        const webPhone = await extractPhoneFromWebsite(website);
+        if (webPhone) return { phone: webPhone.trim(), website };
+      } catch (_) {}
+    }
+
+    return { phone: null, website };
   } catch (_) {
-    return null;
+    return { phone: null, website: fallbackWebsite };
   } finally {
     await detailPage.close().catch(() => {});
   }
@@ -90,7 +134,12 @@ async function extractNewListings(page, seenNamesArray) {
       );
       if (addrLine) address = addrLine;
 
-      results.push({ name, phone, address, rating, _listingUrl: anchor.href });
+      // Website (if present on card)
+      let website = null;
+      const webAnchor = cardRoot.querySelector('a[data-value="Website"], a[aria-label*="Website"], a[aria-label*="website"]');
+      if (webAnchor && webAnchor.href) website = webAnchor.href;
+
+      results.push({ name, phone, address, rating, website, _listingUrl: anchor.href });
     }
     return results;
   }, seenNamesArray);
@@ -101,7 +150,7 @@ async function extractNewListings(page, seenNamesArray) {
 // When callbacks are provided → progressive/streaming mode (used by Socket.IO).
 // Without callbacks → batch mode (used by REST API, returns full results at end).
 async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {}) {
-  const { onLead, onPhoneUpdate, onComplete } = callbacks;
+  const { onLead, onPhoneUpdate, onComplete, isPaused, isStopped } = callbacks;
   const isProgressive = typeof onLead === "function";
 
   const fullQuery = locationQuery
@@ -179,6 +228,13 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     const PHONE_CONCURRENCY = 2;
     const phoneWorkerPromise = (async () => {
       while (!scrollingDone || phoneQueue.length > 0) {
+        if (typeof isStopped === "function" && isStopped()) break;
+        while (typeof isPaused === "function" && isPaused()) {
+          if (typeof isStopped === "function" && isStopped()) break;
+          await new Promise((r) => setTimeout(r, 400));
+        }
+        if (typeof isStopped === "function" && isStopped()) break;
+
         if (phoneQueue.length === 0) {
           await new Promise((r) => setTimeout(r, 300));
           continue;
@@ -186,14 +242,17 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
         const batch = phoneQueue.splice(0, Math.min(PHONE_CONCURRENCY, phoneQueue.length));
         await Promise.all(
           batch.map(async (lead) => {
-            const phone = await fetchMobilePhone(context, lead._listingUrl);
+            const res = await fetchMobilePhone(context, lead._listingUrl, lead.website);
             delete lead._listingUrl;
-            if (phone) {
-              lead.phone = phone;
-              console.log(`✅ ${lead.name}: ${phone}`);
-              if (isProgressive && onPhoneUpdate) onPhoneUpdate(lead.id, phone);
+            if (res && res.phone) {
+              lead.phone = res.phone;
+              console.log(`✅ ${lead.name}: ${res.phone}`);
+              if (isProgressive && onPhoneUpdate) onPhoneUpdate(lead.id, res.phone);
             } else {
-              console.log(`ℹ️ ${lead.name}: no phone on Google Maps`);
+              console.log(`ℹ️ ${lead.name}: no phone found`);
+            }
+            if (res && res.website && !lead.website) {
+              lead.website = res.website;
             }
           })
         );
@@ -206,6 +265,19 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     const MAX_STALE = 3;
 
     while (true) {
+      if (typeof isStopped === "function" && isStopped()) {
+        console.log("🛑 Scraping stopped by client signal.");
+        break;
+      }
+      while (typeof isPaused === "function" && isPaused()) {
+        if (typeof isStopped === "function" && isStopped()) break;
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      if (typeof isStopped === "function" && isStopped()) {
+        console.log("🛑 Scraping stopped by client signal.");
+        break;
+      }
+
       // Extract listings not yet seen — runs after each scroll
       const newListings = await extractNewListings(page, [...seenNames]);
 

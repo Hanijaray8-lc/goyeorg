@@ -5,13 +5,13 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io'); // Socket.io
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidNormalizedUser, isJidGroup, isJidStatusBroadcast, isJidNewsletter } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidNormalizedUser, isJidGroup, isJidStatusBroadcast, isJidNewsletter, ALL_WA_PATCH_NAMES } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const XLSX = require('xlsx'); 
 require('dotenv').config();
 const crypto = require('crypto');
 
-const { scrapeGoogleMapsLeads } = require('./scraper');
+const { scrapeGoogleMapsLeads } = require('./Scraper');
 const NodeCache = require('node-cache');
 const msgRetryCounterCache = new NodeCache();
 const subscriptionRequestRoutes = require('./routes/subscriptionRequestRoutes');
@@ -34,8 +34,8 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 app.use('/api/subscription-requests', subscriptionRequestRoutes);
 
-// const socialExtractorRoutes = require('./routes/socialExtractor');
-// app.use('/api/social-extractor', socialExtractorRoutes);
+const socialExtractorRoutes = require('./routes/socialExtractor');
+app.use('/api/social-extractor', socialExtractorRoutes);
 
 // Web Scraper API Endpoint
 app.post("/api/scrape-leads", async (req, res) => {
@@ -97,14 +97,17 @@ const messageHistorySchema = new mongoose.Schema({
 
 const MessageHistory = mongoose.models.MessageHistory || mongoose.model('MessageHistory', messageHistorySchema);
 
-// WhatsApp Contacts Persistent Schema (MongoDB Atlas storage so contacts never get lost on server restart)
+// WhatsApp Contacts Persistent Schema (MongoDB Atlas storage keyed by email + phoneNumber)
 const whatsappContactSchema = new mongoose.Schema({
   email: { type: String, required: true, index: true },
+  phoneNumber: { type: String, default: "", index: true },
   contacts: { type: Object, default: {} },
   contactNames: { type: Object, default: {} },
   updatedAt: { type: Date, default: Date.now }
-});
-const WhatsAppContact = mongoose.models.WhatsAppContact || mongoose.model('WhatsAppContact', whatsappContactSchema);
+}, { strict: false });
+whatsappContactSchema.index({ email: 1, phoneNumber: 1 });
+delete mongoose.models.WhatsAppContact;
+const WhatsAppContact = mongoose.model('WhatsAppContact', whatsappContactSchema);
 
 // --- WhatsApp Logic Setup (User-Specific) ---
 const userClients = {}; // key: email, value: { whatsappClient, latestQR, isWhatsAppAuthenticated }
@@ -113,6 +116,8 @@ const emailToSockets = {}; // key: email, value: array of socket.id
 
 app.set('userClients', userClients);
 app.set('emitToUserSockets', emitToUserSockets);
+global.userClients = userClients;
+global.emitToUserSockets = emitToUserSockets;
 
 function emitToUserSockets(email, event, data) {
     const socketIds = emailToSockets[email];
@@ -155,7 +160,7 @@ async function fetchAndBroadcastContacts(email, userClient) {
             console.warn(`[auto-contacts] Could not pre-fetch groups:`, err.message);
         }
         
-        const contactsList = await getContactsForUser(userClient);
+        const contactsList = await getContactsForUser(userClient, email);
         console.log(`📋 Contacts found for ${email}: ${contactsList.length}`);
         emitToUserSockets(email, "contacts_list", { success: true, contacts: contactsList });
     } catch (err) {
@@ -283,14 +288,33 @@ async function getGroupsForUser(userClient, { forceRefresh = false } = {}) {
     return userClient.groupsFetchInFlight;
 }
 
-async function getContactsForUser(userClient, userEmail = "") {
+async function getContactsForUser(userClient, userEmail = "", { forceRefresh = false } = {}) {
     if (!userClient) return [];
+    const currentPhone = userClient.whatsappClient?.user?.id 
+        ? userClient.whatsappClient.user.id.split(':')[0].replace(/\D/g, '') 
+        : (userClient.currentPhone || '');
+
+    if (forceRefresh) {
+        userClient.contactsMap = {};
+        userClient.contactNames = {};
+    }
+
+    if (userClient.lastPhone && currentPhone && userClient.lastPhone !== currentPhone) {
+        console.log(`🔄 [Contacts] Phone changed (${userClient.lastPhone} -> ${currentPhone}). Resetting cache.`);
+        userClient.contactsMap = {};
+        userClient.contactNames = {};
+    }
+    if (currentPhone) {
+        userClient.lastPhone = currentPhone;
+    }
+
     if (!userClient.contactsMap) userClient.contactsMap = {};
-    
-    // Attempt database restore if memory cache has very few contacts
-    if (userEmail && Object.keys(userClient.contactsMap).length < 5) {
+    if (!userClient.contactNames) userClient.contactNames = {};
+
+    // Attempt database restore if memory cache has very few contacts and not force refresh
+    if (!forceRefresh && userEmail && Object.keys(userClient.contactsMap).length < 5 && currentPhone) {
         try {
-            const record = await WhatsAppContact.findOne({ email: userEmail.toLowerCase() });
+            const record = await WhatsAppContact.findOne({ email: userEmail.toLowerCase(), phoneNumber: currentPhone });
             if (record && record.contacts && typeof record.contacts === "object") {
                 userClient.contactsMap = { ...(record.contacts || {}), ...(userClient.contactsMap || {}) };
                 if (record.contactNames && typeof record.contactNames === "object") {
@@ -322,6 +346,8 @@ async function getContactsForUser(userClient, userEmail = "") {
                         }
                         
                         if (effectiveNumber && effectiveNumber.length >= 7 && effectiveNumber.length <= 15) {
+                            if (currentPhone && effectiveNumber === currentPhone) return; // Skip user's own number
+
                             const jid = `${effectiveNumber}@s.whatsapp.net`;
                             if (!userClient.contactsMap[jid]) {
                                 userClient.contactsMap[jid] = {
@@ -367,6 +393,7 @@ async function getContactsForUser(userClient, userEmail = "") {
         c.number && 
         c.number.length >= 7 && 
         c.number.length <= 15 && 
+        (!currentPhone || c.number !== currentPhone) &&
         !c.id.includes('@g.us') && 
         !c.id.includes('@broadcast') &&
         !c.id.includes('@lid') &&       
@@ -384,17 +411,33 @@ async function getContactsForUser(userClient, userEmail = "") {
 async function saveContactsToDisk(email, folderName) {
     try {
         if (!userClients[email] || !userClients[email].contactsMap) return;
+        const currentPhone = userClients[email]?.whatsappClient?.user?.id 
+            ? userClients[email].whatsappClient.user.id.split(':')[0].replace(/\D/g, '')
+            : (userClients[email].currentPhone || '');
+        if (!currentPhone) return;
+
         const filePath = path.join(__dirname, folderName, "contacts.json");
-        fs.writeFileSync(filePath, JSON.stringify(userClients[email].contactsMap, null, 2), "utf8");
+        const payload = {
+            phoneNumber: currentPhone,
+            contacts: userClients[email].contactsMap,
+            contactNames: userClients[email].contactNames || {}
+        };
+        fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
     } catch (_) {}
 
     // Persistent MongoDB Atlas backup (Survives Render server restarts/deploys)
     try {
         if (email && userClients[email]?.contactsMap && Object.keys(userClients[email].contactsMap).length > 0) {
+            const currentPhone = userClients[email]?.whatsappClient?.user?.id 
+                ? userClients[email].whatsappClient.user.id.split(':')[0].replace(/\D/g, '')
+                : (userClients[email].currentPhone || '');
+            if (!currentPhone) return;
+
             await WhatsAppContact.findOneAndUpdate(
-                { email: email.toLowerCase() },
+                { email: email.toLowerCase(), phoneNumber: currentPhone },
                 {
                     email: email.toLowerCase(),
+                    phoneNumber: currentPhone,
                     contacts: userClients[email].contactsMap,
                     contactNames: userClients[email].contactNames || {},
                     updatedAt: new Date()
@@ -407,18 +450,26 @@ async function saveContactsToDisk(email, folderName) {
     }
 }
 
-async function loadContactsFromDisk(email, folderName) {
+async function loadContactsFromDisk(email, folderName, targetPhone = "") {
+    if (!targetPhone) return; // Never load contacts if target phone is unknown!
+
     try {
         const filePath = path.join(__dirname, folderName, "contacts.json");
         if (fs.existsSync(filePath)) {
             const raw = fs.readFileSync(filePath, "utf8");
             const data = JSON.parse(raw);
             if (data && typeof data === "object") {
-                if (!userClients[email]) userClients[email] = {};
-                userClients[email].contactsMap = data;
-                if (!userClients[email].contactNames) userClients[email].contactNames = {};
-                for (const [id, c] of Object.entries(data)) {
-                    if (c && c.name) userClients[email].contactNames[id] = c.name;
+                const filePhone = data.phoneNumber ? String(data.phoneNumber).replace(/\D/g, '') : '';
+                if (filePhone && filePhone !== targetPhone) {
+                    console.log(`🔄 [Disk] Stale contacts.json from old phone ${filePhone} discarded for ${targetPhone}.`);
+                    try { fs.unlinkSync(filePath); } catch (_) {}
+                } else if (data.contacts && (filePhone === targetPhone || !filePhone)) {
+                    if (!userClients[email]) userClients[email] = {};
+                    userClients[email].contactsMap = data.contacts;
+                    if (!userClients[email].contactNames) userClients[email].contactNames = {};
+                    for (const [id, c] of Object.entries(data.contacts)) {
+                        if (c && c.name) userClients[email].contactNames[id] = c.name;
+                    }
                 }
             }
         }
@@ -427,14 +478,14 @@ async function loadContactsFromDisk(email, folderName) {
     // Load from MongoDB Atlas if disk cache was wiped by server restart/deploy
     try {
         if (email) {
-            const record = await WhatsAppContact.findOne({ email: email.toLowerCase() });
+            const record = await WhatsAppContact.findOne({ email: email.toLowerCase(), phoneNumber: targetPhone });
             if (record && record.contacts && typeof record.contacts === "object") {
                 if (!userClients[email]) userClients[email] = {};
                 userClients[email].contactsMap = { ...(record.contacts || {}), ...(userClients[email].contactsMap || {}) };
                 if (record.contactNames && typeof record.contactNames === "object") {
                     userClients[email].contactNames = { ...(record.contactNames || {}), ...(userClients[email].contactNames || {}) };
                 }
-                console.log(`✅ [MongoDB] Restored ${Object.keys(userClients[email].contactsMap).length} contacts for ${email}`);
+                console.log(`✅ [MongoDB] Restored ${Object.keys(userClients[email].contactsMap).length} contacts for ${email} (phone: ${targetPhone})`);
             }
         }
     } catch (dbErr) {
@@ -461,9 +512,14 @@ async function startWhatsAppForUser(email) {
 
     try {
         const folderName = `auth_info_${email.replace(/[^a-zA-Z0-9]/g, '_')}`;
-        await loadContactsFromDisk(email, folderName);
-
         const { state, saveCreds } = await useMultiFileAuthState(folderName);
+        const savedPhone = state.creds?.me?.id ? state.creds.me.id.split(':')[0].replace(/\D/g, '') : '';
+        if (savedPhone) {
+            userClients[email].currentPhone = savedPhone;
+            userClients[email].lastPhone = savedPhone;
+            await loadContactsFromDisk(email, folderName, savedPhone);
+        }
+
         const { version } = await fetchLatestBaileysVersion();
 
         const messageStore = userClients[email].messageStore || {};
@@ -799,17 +855,31 @@ async function startWhatsAppForUser(email) {
                     userClients[email].latestQR = ""; 
                     userClients[email].isWhatsAppAuthenticated = true;
                     
+                    const connectedPhone = client.user?.id ? client.user.id.split(':')[0].replace(/\D/g, '') : '';
+                    userClients[email].currentPhone = connectedPhone;
+                    userClients[email].lastPhone = connectedPhone;
+
                     const userInfo = client.user ? {
-                        id: client.user.id ? client.user.id.split(':')[0] : '',
+                        id: connectedPhone,
                         name: client.user.name || client.user.verifiedName || ''
                     } : null;
-                    
-                    emitToUserSockets(email, "ready", { message: "WhatsApp Authenticated Successfully!", user: userInfo });
 
-                    setTimeout(() => {
-                        fetchAndBroadcastGroups(email, userClients[email], { forceRefresh: true });
-                        fetchAndBroadcastContacts(email, userClients[email]);
-                    }, 1200);
+                    // Trigger app-state sync to pull contacts from WhatsApp cloud
+                    if (typeof client.resyncAppState === 'function' && Array.isArray(ALL_WA_PATCH_NAMES)) {
+                        client.resyncAppState(ALL_WA_PATCH_NAMES, false).catch(err => {
+                            console.warn('[resyncAppState] Cloud sync notice:', err.message);
+                        });
+                    }
+
+                    // Ensure contacts from disk/DB match this phone
+                    loadContactsFromDisk(email, folderName, connectedPhone).then(() => {
+                        emitToUserSockets(email, "ready", { message: "WhatsApp Authenticated Successfully!", user: userInfo });
+
+                        setTimeout(() => {
+                            fetchAndBroadcastGroups(email, userClients[email], { forceRefresh: true });
+                            fetchAndBroadcastContacts(email, userClients[email]);
+                        }, 1200);
+                    });
                 }
             }
 
@@ -923,18 +993,28 @@ io.on("connection", (socket) => {
         if (userClient) {
             userClient.isWhatsAppAuthenticated = false;
             userClient.latestQR = "";
+            userClient.contactsMap = {};
+            userClient.contactNames = {};
+            userClient.currentPhone = "";
+            userClient.lastPhone = "";
             if (userClient.whatsappClient) {
                 userClient.whatsappClient.ev.removeAllListeners('connection.update');
                 try { userClient.whatsappClient.end(new Error("Force reset")); } catch(e) {}
             }
         }
+
+        emitToUserSockets(email, "contacts_list", { success: true, contacts: [] });
+        emitToUserSockets(email, "groups_list", { success: true, groups: [] });
         
-        setTimeout(() => {
+        setTimeout(async () => {
             const folderName = `auth_info_${email.replace(/[^a-zA-Z0-9]/g, '_')}`;
             const authPath = path.join(__dirname, folderName);
             if (fs.existsSync(authPath)) {
                 try { fs.rmSync(authPath, { recursive: true, force: true }); } catch(e) {}
             }
+            try {
+                await WhatsAppContact.deleteMany({ email: email.toLowerCase() });
+            } catch (_) {}
             delete userClients[email];
             startWhatsAppForUser(email);
             forceResetting = false;
@@ -1006,6 +1086,13 @@ io.on("connection", (socket) => {
             if (num && String(num).trim() !== "") {
                 validNumbersCount++;
                 let cleanNum = String(num).replace(/\D/g, '');
+                if (cleanNum.length < 10) {
+                    console.error(`❌ Number ${num} is invalid (less than 10 digits)`);
+                    socket.emit("bulk_progress_update", { status: "failed", number: num, reason: "Invalid phone number (must be at least 10 digits)" });
+                    failedCount++;
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    continue;
+                }
                 if (cleanNum.length === 10) {
                     cleanNum = '91' + cleanNum;
                 }
@@ -1017,7 +1104,7 @@ io.on("connection", (socket) => {
                     let existsOnWA = true;
                     try {
                         const checkNumber = await whatsappClient.onWhatsApp(formattedNumber);
-                        if (checkNumber && checkNumber.length > 0 && !checkNumber[0].exists) {
+                        if (!checkNumber || checkNumber.length === 0 || !checkNumber[0]?.exists) {
                             existsOnWA = false;
                         }
                     } catch (checkErr) {
@@ -1101,7 +1188,10 @@ io.on("connection", (socket) => {
                             }
                         }
                     } else {
-                        await whatsappClient.sendMessage(formattedNumber, { text: text || '' });
+                        const sentResult = await whatsappClient.sendMessage(formattedNumber, { text: text || '' });
+                        if (sentResult && sentResult.key && sentResult.key.id && userClient && userClient.messageStore) {
+                            userClient.messageStore[sentResult.key.id] = sentResult.message;
+                        }
                     }
                     try { await whatsappClient.sendPresenceUpdate('paused', formattedNumber); } catch (e) {}
                     console.log(`✅ Message sent to ${num}`);
@@ -1222,8 +1312,16 @@ io.on("connection", (socket) => {
                 console.warn(`[get_contacts] Could not pre-fetch groups for contact extraction:`, groupErr.message);
             }
 
-            const contactsList = await getContactsForUser(userClient, email);
-            console.log(`📋 [get_contacts] Contacts found for ${email}: ${contactsList.length}`);
+            const forceRefresh = Boolean(data && data.forceRefresh);
+            if (forceRefresh && typeof userClient.whatsappClient?.resyncAppState === 'function' && Array.isArray(ALL_WA_PATCH_NAMES)) {
+                try {
+                    await userClient.whatsappClient.resyncAppState(ALL_WA_PATCH_NAMES, false);
+                } catch (syncErr) {
+                    console.warn(`[get_contacts] resyncAppState warning:`, syncErr.message);
+                }
+            }
+            const contactsList = await getContactsForUser(userClient, email, { forceRefresh });
+            console.log(`📋 [get_contacts] Contacts found for ${email} (forceRefresh=${forceRefresh}): ${contactsList.length}`);
             socket.emit("contacts_list", { success: true, contacts: contactsList });
         } catch (err) {
             console.error(`❌ [get_contacts] Error fetching contacts for ${email}:`, err);
@@ -1273,6 +1371,7 @@ io.on("connection", (socket) => {
     });
 
     // --- Web Scraper: Google Maps Scraping ---
+    const { extractSocialsFromWebsite } = require("./utils/socialLinkExtractor");
     socket.on("start_scrape", async (data) => {
         const { query, location } = data || {};
         if (!query || !query.trim()) {
@@ -1280,12 +1379,31 @@ io.on("connection", (socket) => {
             return;
         }
 
+        socket.scrapeState = { isPaused: false, isStopped: false };
+
         console.log(`🕷️ [WebScraper] Starting scrape for query: "${query}", location: "${location || ""}"`);
 
         try {
             await scrapeGoogleMapsLeads(query, location, {
+                isPaused: () => !!(socket.scrapeState && socket.scrapeState.isPaused),
+                isStopped: () => !!(socket.scrapeState && socket.scrapeState.isStopped),
                 onLead: (lead) => {
                     socket.emit("scrape_lead", lead);
+
+                    // Background official social extractor from website
+                    if (lead.website) {
+                        extractSocialsFromWebsite(lead.website)
+                            .then((socials) => {
+                                if (socials && (socials.instagram || socials.facebook || socials.youtube)) {
+                                    socket.emit("scrape_socials_update", {
+                                        id: lead.id,
+                                        name: lead.name,
+                                        socials
+                                    });
+                                }
+                            })
+                            .catch(() => {});
+                    }
                 },
                 onPhoneUpdate: (id, phone) => {
                     socket.emit("scrape_phone_update", { id, phone });
@@ -1297,6 +1415,31 @@ io.on("connection", (socket) => {
         } catch (err) {
             console.error("❌ Web Scraper error:", err);
             socket.emit("scrape_error", { message: err.message || "Failed to scrape listings." });
+        }
+    });
+
+    socket.on("pause_scrape", () => {
+        if (socket.scrapeState) {
+            socket.scrapeState.isPaused = true;
+            console.log("⏸️ [WebScraper] Scrape paused by client.");
+            socket.emit("scrape_paused");
+        }
+    });
+
+    socket.on("resume_scrape", () => {
+        if (socket.scrapeState) {
+            socket.scrapeState.isPaused = false;
+            console.log("▶️ [WebScraper] Scrape resumed by client.");
+            socket.emit("scrape_resumed");
+        }
+    });
+
+    socket.on("stop_scrape", () => {
+        if (socket.scrapeState) {
+            socket.scrapeState.isStopped = true;
+            socket.scrapeState.isPaused = false;
+            console.log("⏹️ [WebScraper] Scrape stopped by client.");
+            socket.emit("scrape_stopped");
         }
     });
 });
@@ -1438,6 +1581,11 @@ function scheduleJob(scheduleDoc) {
  
                 validNumbersCount++;
                 let cleanNum = String(num).replace(/\D/g, '');
+                if (cleanNum.length < 10) {
+                    io.emit("bulk_progress_update", { status: "failed", number: num, reason: "Invalid phone number (must be at least 10 digits)" });
+                    failedCount++;
+                    continue;
+                }
                 if (cleanNum.length === 10) {
                     cleanNum = '91' + cleanNum;
                 }
@@ -1521,7 +1669,10 @@ function scheduleJob(scheduleDoc) {
                             }
                         }
                     } else {
-                        await whatsappClient.sendMessage(formattedNumber, { text: scheduleDoc.message || '' });
+                        const sentResult = await whatsappClient.sendMessage(formattedNumber, { text: scheduleDoc.message || '' });
+                        if (sentResult && sentResult.key && sentResult.key.id && userClients[email] && userClients[email].messageStore) {
+                            userClients[email].messageStore[sentResult.key.id] = sentResult.message;
+                        }
                     }
                     io.emit("bulk_progress_update", { status: "sent", number: num });
                     try {
@@ -1653,6 +1804,7 @@ const freeUserSchema = new mongoose.Schema({
   location: { type: String, required: true },
   createdAt: { type: Date, default: Date.now },
   credits: { type: Number, default: 30 },
+  freeCredits: { type: Number, default: 30 },
   totalSent: { type: Number, default: 0 },
   lastDailyRewardDate: { type: String, default: "" },
   isSubscribed: { type: Boolean, default: false },
@@ -1668,10 +1820,10 @@ const freeUserSchema = new mongoose.Schema({
 const FreeUser = mongoose.models.FreeUser || mongoose.model('FreeUser', freeUserSchema);
 
 // Helper to get today's date in YYYY-MM-DD format (local timezone)
-function getTodayDateString() {
-  const d = new Date();
-  const offset = d.getTimezoneOffset() * 60000;
-  return new Date(d.getTime() - offset).toISOString().split('T')[0];
+function getTodayDateString(d = new Date()) {
+  const dateObj = (d instanceof Date) ? d : new Date(d);
+  const offset = dateObj.getTimezoneOffset() * 60000;
+  return new Date(dateObj.getTime() - offset).toISOString().split('T')[0];
 }
 
 // 🧪 TEST ENDPOINT FOR IMMEDIATE VERIFICATION (Simulate Yesterday / Midnight)
@@ -1794,30 +1946,40 @@ async function checkAndApplyDailyReset(userDoc, Model) {
     return userDoc;
   }
 
-  // If user has EVER subscribed (has active or expired subscription history),
-  // permanently STOP the daily 10 credit logic!
-  const hasSubscriptionHistory = !!(userDoc.subscriptionExpiresAt || userDoc.subscriptionStartedAt || userDoc.subscriptionPlan);
-  if (hasSubscriptionHistory) {
-    // If expired, ensure isSubscribed is false and credits are 0
-    const isStillSubscribed = !!(userDoc.subscriptionExpiresAt && new Date(userDoc.subscriptionExpiresAt).getTime() > Date.now());
-    if (!isStillSubscribed && (userDoc.isSubscribed || userDoc.credits !== 0)) {
-      const updated = await Model.findByIdAndUpdate(
-        userDoc._id,
-        { $set: { isSubscribed: false, credits: 0 } },
-        { returnDocument: 'after' }
-      );
-      if (updated) return updated;
-    }
+  // If user has an ACTIVE subscription, keep active and do not reset
+  const isStillSubscribed = !!(
+    userDoc.isSubscribed &&
+    userDoc.subscriptionExpiresAt &&
+    new Date(userDoc.subscriptionExpiresAt).getTime() > Date.now()
+  );
+  if (isStillSubscribed) {
     return userDoc;
   }
 
   const today = getTodayDateString();
 
-  // If user doc has no lastDailyRewardDate set yet, initialize it to today so we don't repeatedly reset credits
+  // STRICT IDEMPOTENCY: If daily reward was already applied/processed today, NEVER touch or reset credits again today!
+  // Return userDoc immediately with exact remaining balance!
+  if (userDoc.lastDailyRewardDate === today) {
+    return userDoc;
+  }
+
+  // If user account was created TODAY, this is their first trial day with 30 credits!
+  // Do NOT reset to 10 on registration day!
+  const isCreatedToday = userDoc.createdAt && getTodayDateString(new Date(userDoc.createdAt)) === today;
+  if (isCreatedToday) {
+    if (userDoc.lastDailyRewardDate !== today) {
+      await Model.findByIdAndUpdate(userDoc._id, { $set: { lastDailyRewardDate: today } });
+    }
+    return userDoc;
+  }
+
+  // If user doc has no lastDailyRewardDate set yet, initialize it to today and guarantee at least 10 credits
   if (!userDoc.lastDailyRewardDate) {
+    const defaultCredits = (userDoc.credits !== undefined && userDoc.credits > 0) ? userDoc.credits : 10;
     const updated = await Model.findByIdAndUpdate(
       userDoc._id,
-      { $set: { lastDailyRewardDate: today } },
+      { $set: { lastDailyRewardDate: today, credits: defaultCredits, freeCredits: defaultCredits, isSubscribed: false } },
       { returnDocument: 'after' }
     );
     if (updated) return updated;
@@ -1829,17 +1991,13 @@ async function checkAndApplyDailyReset(userDoc, Model) {
     const updatedUser = await Model.findOneAndUpdate(
       {
         _id: userDoc._id,
-        lastDailyRewardDate: { $ne: today },
-        subscriptionExpiresAt: null,
-        subscriptionStartedAt: null,
-        $or: [
-          { isSubscribed: false },
-          { isSubscribed: { $exists: false } }
-        ]
+        lastDailyRewardDate: { $ne: today }
       },
       {
         $set: {
           credits: 10,
+          freeCredits: 10,
+          isSubscribed: false,
           lastDailyRewardDate: today
         }
       },
@@ -1851,11 +2009,27 @@ async function checkAndApplyDailyReset(userDoc, Model) {
     }
   }
 
+  // Zero-Credit Expiry Guard: If an expired plan user comes back and has 0 credits, grant daily 10 credits immediately
+  if ((!userDoc.credits || userDoc.credits <= 0) && (!userDoc.subscriptionExpiresAt || new Date(userDoc.subscriptionExpiresAt).getTime() <= Date.now())) {
+    const updatedUser = await Model.findOneAndUpdate(
+      { _id: userDoc._id },
+      {
+        $set: {
+          credits: 10,
+          freeCredits: 10,
+          isSubscribed: false,
+          lastDailyRewardDate: today
+        }
+      },
+      { returnDocument: 'after' }
+    );
+    if (updatedUser) return updatedUser;
+  }
+
   return userDoc;
 }
 
 // Background sweep running periodically to reset free user credits at midnight
-// Strictly resets ONLY pure FreeUser accounts that have NEVER subscribed
 async function runDailyCreditResetSweep() {
   try {
     if (mongoose.connection.readyState !== 1) {
@@ -1866,27 +2040,25 @@ async function runDailyCreditResetSweep() {
 
     const resetQuery = {
       lastDailyRewardDate: { $ne: today },
-      subscriptionExpiresAt: null,
-      subscriptionStartedAt: null,
-      $or: [
-        { subscriptionPlan: "" },
-        { subscriptionPlan: null },
-        { subscriptionPlan: { $exists: false } }
-      ],
+      createdAt: { $lt: new Date(new Date().setHours(0, 0, 0, 0)) },
       $or: [
         { isSubscribed: false },
-        { isSubscribed: { $exists: false } }
+        { isSubscribed: { $exists: false } },
+        { subscriptionExpiresAt: null },
+        { subscriptionExpiresAt: { $exists: false } },
+        { subscriptionExpiresAt: { $lte: new Date() } }
       ]
     };
 
     const updateDoc = {
       $set: {
         credits: 10,
+        freeCredits: 10,
+        isSubscribed: false,
         lastDailyRewardDate: today
       }
     };
 
-    // Strictly reset ONLY pure FreeUser accounts that have NEVER subscribed
     if (mongoose.models.FreeUser) {
       await mongoose.models.FreeUser.updateMany(resetQuery, updateDoc);
     }
@@ -1895,7 +2067,24 @@ async function runDailyCreditResetSweep() {
   }
 }
 
-// Run reset sweep periodically every 10 minutes (connection callback triggers initial run)
+// Exact Midnight (12:00:05 AM) Daily Trigger
+function scheduleMidnightSweep() {
+  try {
+    const now = new Date();
+    const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
+    const msUntilMidnight = Math.max(1000, nextMidnight.getTime() - now.getTime());
+
+    setTimeout(() => {
+      runDailyCreditResetSweep();
+      setInterval(runDailyCreditResetSweep, 24 * 60 * 60 * 1000);
+    }, msUntilMidnight);
+  } catch (err) {
+    console.warn('⚠️ Midnight scheduler warning:', err.message);
+  }
+}
+scheduleMidnightSweep();
+
+// Run reset sweep periodically every 10 minutes as backup safety net
 setInterval(runDailyCreditResetSweep, 10 * 60 * 1000);
 
 app.post('/api/register', async (req, res) => {
@@ -2143,6 +2332,23 @@ app.post('/api/free-user/login', async (req, res) => {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
+    // STRICT GATEKEEPER:
+    // Once a user has subscribed to ANY plan (current or expired), they are a Subscribed User!
+    // They are strictly barred from logging into the Free User portal forever.
+    const subUser = mongoose.models.User ? await mongoose.models.User.findOne({ email: safeEmailRegex }) : null;
+    const hasSubHistory = !!(
+      (subUser && (subUser.hasEverSubscribed || subUser.subscriptionPlan || subUser.subscriptionStartedAt || subUser.isSubscribed)) ||
+      (freeUser && (freeUser.hasEverSubscribed || freeUser.subscriptionPlan || freeUser.subscriptionStartedAt || freeUser.isSubscribed))
+    );
+
+    if (hasSubHistory) {
+      return res.status(403).json({
+        isUpgradedUser: true,
+        message: 'You have upgraded to a Premium Subscribed account! Free User portal is only for new trial users. Please log in through the Subscribed Portal.',
+        redirectUrl: '/userlogin'
+      });
+    }
+
     // Auto-sync into FreeUser collection so they appear in Admin Free Users page!
     if (mongoose.models.FreeUser) {
       try {
@@ -2158,6 +2364,7 @@ app.post('/api/free-user/login', async (req, res) => {
             phone: freeUser.phone || "",
             location: freeUser.location || "",
             credits: 30,
+            freeCredits: 30,
             totalSent: 0,
             lastDailyRewardDate: getTodayDateString(),
             isSubscribed: false,
@@ -2190,10 +2397,16 @@ app.post('/api/free-user/login', async (req, res) => {
     // STRICT ISOLATION:
     // Free User side must NEVER inherit Subscription plan or 99999 subscription credits!
     // Free User always operates strictly under Free User rules (30 initial credits, 10 daily).
-    let freeCredits = freeUser.freeCredits !== undefined ? freeUser.freeCredits : freeUser.credits;
-    if (freeCredits === undefined || freeCredits === null || (freeCredits === 0 && (freeUser.freeTotalSent || freeUser.totalSent || 0) === 0)) {
-      freeCredits = 30;
-      await modelToUse.findByIdAndUpdate(freeUser._id, { $set: { freeCredits: 30, credits: 30 } });
+    let freeCredits = 0;
+    const rawVal = Number(freeUser.freeCredits !== undefined && freeUser.freeCredits !== null ? freeUser.freeCredits : (freeUser.credits || 0));
+    if (rawVal >= 9999) {
+      freeCredits = 0;
+    } else if (rawVal > 0) {
+      freeCredits = rawVal;
+    } else {
+      // Brand new user with 0 sent gets 30
+      freeCredits = (freeUser.freeTotalSent || freeUser.totalSent || 0) === 0 ? 30 : 0;
+      await modelToUse.findByIdAndUpdate(freeUser._id, { $set: { freeCredits: freeCredits, credits: freeCredits } });
     }
 
     res.status(200).json({
@@ -2352,7 +2565,7 @@ app.post('/api/free-user/credits', async (req, res) => {
     freeUser = await checkAndApplyDailyReset(freeUser, modelToUse);
     const hasSubHistory = !!(freeUser.subscriptionExpiresAt || freeUser.subscriptionStartedAt || freeUser.subscriptionPlan);
     const isSubscribed = !!(freeUser.subscriptionExpiresAt && new Date(freeUser.subscriptionExpiresAt).getTime() > Date.now());
-    const effectiveCredits = isSubscribed ? 99999 : (freeUser.credits !== undefined ? freeUser.credits : 0);
+    const effectiveCredits = isSubscribed ? 99999 : (freeUser.credits !== undefined && Number(freeUser.credits) <= 30 ? Number(freeUser.credits) : (freeUser.freeCredits !== undefined && Number(freeUser.freeCredits) <= 30 ? Number(freeUser.freeCredits) : 0));
 
     let normalizedSent = freeUser.totalSent || 0;
     if (!isSubscribed && effectiveCredits <= 0 && normalizedSent % 2 !== 0) {
@@ -2442,7 +2655,7 @@ app.post('/api/free-user/message-sent', async (req, res) => {
 
 app.get('/api/admin/free-users', async (req, res) => {
   try {
-    const freeUsers = await FreeUser.find({}, '-password').sort({ _id: -1 }).lean();
+    const freeUsers = await FreeUser.find({}).sort({ _id: -1 }).lean();
     const withStatus = freeUsers.map((u) => ({ ...u, status: u.status || "active" }));
     res.status(200).json(withStatus);
   } catch (error) {
@@ -2462,7 +2675,7 @@ app.patch('/api/admin/free-users/:id/status', async (req, res) => {
       req.params.id,
       { status },
       { returnDocument: 'after' }
-    ).select('-password');
+    );
 
     if (!freeUser) return res.status(404).json({ message: "Free user not found" });
 
@@ -2478,7 +2691,7 @@ app.patch('/api/admin/free-users/:id/status', async (req, res) => {
 
 app.get('/api/users', async (req, res) => {
   try {
-    const users = await User.find({}, '-password').sort({ _id: -1 }).lean();
+    const users = await User.find({}).sort({ _id: -1 }).lean();
     res.status(200).json(users);
   } catch (error) {
     res.status(500).json({ message: "Error fetching users", error });
@@ -2492,6 +2705,142 @@ app.delete('/api/users/:id', async (req, res) => {
     res.status(200).json({ message: "User deleted successfully" });
   } catch (error) {
     res.status(500).json({ message: "Error deleting user", error });
+  }
+});
+
+// Admin endpoint to change or assign a plan to any user directly
+app.post('/api/admin/change-user-plan', async (req, res) => {
+  try {
+    const { email, plan } = req.body;
+    if (!email || !plan) {
+      return res.status(400).json({ success: false, message: "Email and plan are required." });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const safeRegex = new RegExp(`^${cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+
+    const lowerPlan = String(plan).toLowerCase();
+    let durationMs = 24 * 60 * 60 * 1000;
+    let durationText = "24 Hours";
+
+    if (lowerPlan.includes('week')) {
+      durationMs = 7 * 24 * 60 * 60 * 1000;
+      durationText = "7 Days";
+    } else if (lowerPlan.includes('15') || lowerPlan.includes('fifteen')) {
+      durationMs = 15 * 24 * 60 * 60 * 1000;
+      durationText = "15 Days";
+    } else if (lowerPlan.includes('3 month') || lowerPlan.includes('three')) {
+      durationMs = 90 * 24 * 60 * 60 * 1000;
+      durationText = "3 Months";
+    } else if (lowerPlan.includes('6 month') || lowerPlan.includes('six')) {
+      durationMs = 180 * 24 * 60 * 60 * 1000;
+      durationText = "6 Months";
+    } else if (lowerPlan.includes('18 month') || lowerPlan.includes('eighteen')) {
+      durationMs = 540 * 24 * 60 * 60 * 1000;
+      durationText = "18 Months";
+    } else if (lowerPlan.includes('year') || lowerPlan.includes('1 yr')) {
+      durationMs = 365 * 24 * 60 * 60 * 1000;
+      durationText = "1 Year";
+    } else if (lowerPlan.includes('month')) {
+      durationMs = 30 * 24 * 60 * 60 * 1000;
+      durationText = "30 Days";
+    }
+
+    const formatDate = (date) => {
+      return date.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) + ', ' +
+             date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+    };
+
+    const db = mongoose.connection.db;
+    let existingUser = await User.findOne({ email: safeRegex });
+    if (!existingUser) {
+      existingUser = await FreeUser.findOne({ email: safeRegex });
+    }
+
+    if (!existingUser) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    const nowTime = Date.now();
+    const isCurrentlyActive = existingUser.isSubscribed && 
+      existingUser.subscriptionExpiresAt && 
+      new Date(existingUser.subscriptionExpiresAt).getTime() > nowTime;
+
+    let userUpdate = {};
+    let notifTitle = "";
+    let notifMessage = "";
+    let isQueued = false;
+
+    if (isCurrentlyActive) {
+      const baseTime = (existingUser.upcomingPlanExpiresAt && new Date(existingUser.upcomingPlanExpiresAt).getTime() > new Date(existingUser.subscriptionExpiresAt).getTime())
+        ? new Date(existingUser.upcomingPlanExpiresAt).getTime()
+        : new Date(existingUser.subscriptionExpiresAt).getTime();
+
+      const upcomingStartsAt = new Date(baseTime);
+      const upcomingExpiresAt = new Date(baseTime + durationMs);
+
+      userUpdate = {
+        isSubscribed: true,
+        hasEverSubscribed: true,
+        credits: 99999,
+        upcomingPlan: plan,
+        upcomingPlanStartsAt: upcomingStartsAt,
+        upcomingPlanExpiresAt: upcomingExpiresAt
+      };
+      isQueued = true;
+      notifTitle = "⏳ Plan Queued!";
+      notifMessage = `Your ${plan} has been approved and queued by Admin!\nIt will automatically activate when your current plan ends on: ${formatDate(upcomingStartsAt)}\nValid until: ${formatDate(upcomingExpiresAt)} (${durationText}).`;
+    } else {
+      const startedAt = new Date();
+      const expiresAt = new Date(startedAt.getTime() + durationMs);
+
+      userUpdate = {
+        isSubscribed: true,
+        hasEverSubscribed: true,
+        subscriptionPlan: plan,
+        subscriptionStartedAt: startedAt,
+        subscriptionExpiresAt: expiresAt,
+        upcomingPlan: "",
+        upcomingPlanStartsAt: null,
+        upcomingPlanExpiresAt: null,
+        credits: 99999
+      };
+      notifTitle = "🎉 Plan Activated!";
+      notifMessage = `Your ${plan} has been assigned and activated by Admin.\nStart: ${formatDate(startedAt)}\nExpires: ${formatDate(expiresAt)}\nValid for: ${durationText}.`;
+    }
+
+    if (db) {
+      await db.collection('users').updateMany({ email: safeRegex }, { $set: userUpdate });
+      await db.collection('freeusers').updateMany({ email: safeRegex }, { $set: userUpdate });
+    }
+    await User.updateMany({ email: safeRegex }, { $set: userUpdate });
+    await FreeUser.updateMany({ email: safeRegex }, { $set: userUpdate });
+
+    try {
+      const Notification = require('./models/Notification');
+      const newNotif = new Notification({
+        userEmail: cleanEmail,
+        type: 'request_approved',
+        title: notifTitle,
+        message: notifMessage,
+        creditsEarned: 99999,
+        read: false,
+        createdAt: new Date()
+      });
+      await newNotif.save();
+    } catch (notifErr) {
+      console.warn("Could not save notification:", notifErr.message);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: isQueued ? `Plan "${plan}" queued successfully for ${cleanEmail}.` : `Plan "${plan}" activated immediately for ${cleanEmail}.`,
+      isQueued,
+      userUpdate
+    });
+  } catch (error) {
+    console.error("Admin change user plan error:", error);
+    return res.status(500).json({ success: false, message: "Error changing user plan.", error: error.message });
   }
 });
 
@@ -2510,8 +2859,28 @@ app.post('/api/user/credits', async (req, res) => {
     let user = null;
     let isFreeUser = reqIsFreeUser === true;
     const cleanEmail = email ? String(email).trim() : "";
+    const nowTime = Date.now();
 
-    if (isFreeUser) {
+    // Check if user has an active paid subscription in User or FreeUser collection
+    let paidUserDoc = null;
+    if (cleanEmail) {
+      const emailRegex = new RegExp(`^${cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+      paidUserDoc = await User.findOne({ email: emailRegex });
+      if (!paidUserDoc && mongoose.models.FreeUser) {
+        paidUserDoc = await FreeUser.findOne({ email: emailRegex });
+      }
+    }
+    const hasActiveSub = paidUserDoc && (
+      paidUserDoc.isSubscribed ||
+      (paidUserDoc.subscriptionExpiresAt && new Date(paidUserDoc.subscriptionExpiresAt).getTime() > nowTime) ||
+      (paidUserDoc.upcomingPlanExpiresAt && new Date(paidUserDoc.upcomingPlanExpiresAt).getTime() > nowTime)
+    );
+
+    // If the user has an active subscription, they are definitively a SUBSCRIBED USER
+    if (hasActiveSub) {
+      isFreeUser = false;
+      user = paidUserDoc;
+    } else if (isFreeUser) {
       if (id && mongoose.Types.ObjectId.isValid(id)) {
         user = await FreeUser.findById(id);
       }
@@ -2553,15 +2922,15 @@ app.post('/api/user/credits', async (req, res) => {
     // If request is for Subscription User -> if paid subscription: 99999. If not subscribed: STRICTLY 0! Free credits must NEVER be returned!
     let effectiveCredits = 0;
     if (isFreeUser) {
-      const rawCreds = user.freeCredits !== undefined ? user.freeCredits : (user.credits !== undefined ? user.credits : 30);
-      effectiveCredits = Math.min(30, rawCreds);
+      const rawC = Number(user.freeCredits !== undefined && user.freeCredits !== null ? user.freeCredits : (user.credits || 0));
+      effectiveCredits = rawC >= 9999 ? 0 : Math.max(0, rawC);
     } else {
       effectiveCredits = isSubscribed ? 99999 : 0;
     }
 
     res.status(200).json({ 
       credits: effectiveCredits, 
-      totalSent: isFreeUser ? (user.freeTotalSent || user.totalSent || 0) : (user.totalSent || 0), 
+      totalSent: isFreeUser ? Math.max(user.freeTotalSent || 0, user.totalSent || 0) : (user.totalSent || 0), 
       isSubscribed: isFreeUser ? false : isSubscribed,
       subscriptionPlan: isFreeUser ? "" : (isSubscribed ? (user.subscriptionPlan || "One Day") : (hasSubHistory ? (user.subscriptionPlan || "") : "")),
       subscriptionStartedAt: isFreeUser ? null : (isSubscribed ? user.subscriptionStartedAt : (hasSubHistory ? user.subscriptionStartedAt : null)),
@@ -2627,6 +2996,7 @@ app.post('/api/user/use-credit', async (req, res) => {
       const isSubscribed = !!(user.subscriptionExpiresAt && new Date(user.subscriptionExpiresAt).getTime() > Date.now());
       if (!isSubscribed) {
         user.credits = Math.max(0, (user.credits || 0) - (amount || 1));
+        user.freeCredits = user.credits;
         user.lastDailyRewardDate = getTodayDateString();
         await user.save();
       }
@@ -2661,12 +3031,33 @@ app.post('/api/user/sync-usage', async (req, res) => {
     const isSubscribed = !!(user.subscriptionExpiresAt && new Date(user.subscriptionExpiresAt).getTime() > Date.now());
     if (!isSubscribed && credits !== undefined) {
       user.credits = Math.max(0, Number(credits));
+      user.freeCredits = user.credits;
     }
     if (totalSent !== undefined) {
       user.totalSent = Math.max(user.totalSent || 0, Number(totalSent));
+      user.freeTotalSent = user.totalSent;
     }
     user.lastDailyRewardDate = getTodayDateString();
     await user.save();
+
+    if (user.email) {
+      const cleanEmail = String(user.email).trim();
+      const safeRegex = new RegExp(`^${cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+      try {
+        if (mongoose.models.FreeUser) {
+          await FreeUser.updateMany(
+            { email: safeRegex },
+            { $set: { credits: user.credits, freeCredits: user.credits, totalSent: user.totalSent, freeTotalSent: user.totalSent, lastDailyRewardDate: getTodayDateString() } }
+          );
+        }
+        if (mongoose.models.User) {
+          await User.updateMany(
+            { email: safeRegex },
+            { $set: { credits: user.credits, freeCredits: user.credits, totalSent: user.totalSent, freeTotalSent: user.totalSent, lastDailyRewardDate: getTodayDateString() } }
+          );
+        }
+      } catch (_) {}
+    }
 
     res.status(200).json({ success: true, credits: isSubscribed ? 99999 : user.credits, totalSent: user.totalSent });
   } catch (error) {
@@ -2679,10 +3070,11 @@ app.post('/api/user/add-credits', async (req, res) => {
     const { email, id, amount, exactCredits, totalSent } = req.body;
     const addVal = parseInt(amount || 4, 10);
     let user = null;
+    let safeRegex = null;
     
     if (email) {
       const cleanEmail = String(email).trim();
-      const safeRegex = new RegExp(`^${cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+      safeRegex = new RegExp(`^${cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
       user = await FreeUser.findOne({ email: safeRegex });
       if (!user) {
         user = await User.findOne({ email: safeRegex });
@@ -2698,11 +3090,16 @@ app.post('/api/user/add-credits', async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    if (exactCredits !== undefined) {
-      user.credits = Number(exactCredits);
-    } else {
-      user.credits = (user.credits || 0) + addVal;
+    if (!safeRegex && user.email) {
+      const cleanEmail = String(user.email).trim();
+      safeRegex = new RegExp(`^${cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
     }
+
+    const currentBase = Number(user.credits !== undefined ? user.credits : (user.freeCredits || 0));
+    const finalCredits = exactCredits !== undefined ? Number(exactCredits) : Math.max(0, currentBase + addVal);
+
+    user.credits = finalCredits;
+    user.freeCredits = finalCredits;
 
     if (totalSent !== undefined) {
       user.totalSent = Math.max(user.totalSent || 0, Number(totalSent));
@@ -2711,7 +3108,24 @@ app.post('/api/user/add-credits', async (req, res) => {
     user.lastDailyRewardDate = getTodayDateString();
     await user.save();
 
-    return res.status(200).json({ success: true, credits: user.credits || 0, totalSent: user.totalSent || 0 });
+    if (safeRegex) {
+      try {
+        if (mongoose.models.FreeUser) {
+          await FreeUser.updateMany(
+            { email: safeRegex },
+            { $set: { credits: finalCredits, freeCredits: finalCredits, lastDailyRewardDate: getTodayDateString() } }
+          );
+        }
+        if (mongoose.models.User) {
+          await User.updateMany(
+            { email: safeRegex },
+            { $set: { credits: finalCredits, freeCredits: finalCredits, lastDailyRewardDate: getTodayDateString() } }
+          );
+        }
+      } catch (_) {}
+    }
+
+    return res.status(200).json({ success: true, credits: finalCredits, totalSent: user.totalSent || 0 });
   } catch (error) {
     return res.status(500).json({ success: false, message: "Error adding credits", error: error.message });
   }
@@ -3210,13 +3624,204 @@ app.post('/api/contacts/export', async (req, res) => {
     }
 });
 
+app.post('/api/contacts/import', async (req, res) => {
+    try {
+        const { email, contacts } = req.body || {};
+        if (!email) {
+            return res.status(400).json({ success: false, message: "Email is required." });
+        }
+        if (!Array.isArray(contacts) || contacts.length === 0) {
+            return res.status(400).json({ success: false, message: "No contacts provided to import." });
+        }
+
+        const lookupEmail = email.trim();
+        let userClient = userClients[lookupEmail] || userClients[lookupEmail.toLowerCase()];
+        if (!userClient) {
+            userClient = { contactsMap: {}, contactNames: {} };
+            userClients[lookupEmail] = userClient;
+        }
+
+        if (!userClient.contactsMap) userClient.contactsMap = {};
+        if (!userClient.contactNames) userClient.contactNames = {};
+
+        const currentPhone = userClient.whatsappClient?.user?.id 
+            ? userClient.whatsappClient.user.id.split(':')[0].replace(/\D/g, '') 
+            : (userClient.currentPhone || '');
+
+        let importedCount = 0;
+        for (const item of contacts) {
+            if (!item || !item.number) continue;
+            let rawNum = String(item.number).replace(/\D/g, '');
+            if (rawNum.startsWith('0') && rawNum.length > 10) rawNum = rawNum.replace(/^0+/, '');
+
+            if (rawNum.length >= 7 && rawNum.length <= 15) {
+                if (currentPhone && rawNum === currentPhone) continue; // Exclude own number
+
+                const jid = `${rawNum}@s.whatsapp.net`;
+                const cleanName = (item.name && String(item.name).trim()) || `+${rawNum}`;
+                userClient.contactNames[jid] = cleanName;
+                userClient.contactsMap[jid] = {
+                    id: jid,
+                    name: cleanName,
+                    notify: '',
+                    number: rawNum,
+                    isBusiness: false,
+                    isSavedContact: true
+                };
+                importedCount++;
+            }
+        }
+
+        const folderName = `auth_info_${lookupEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
+        await saveContactsToDisk(lookupEmail, folderName);
+
+        const updatedList = await getContactsForUser(userClient, lookupEmail);
+        emitToUserSockets(lookupEmail, "contacts_list", { success: true, contacts: updatedList });
+
+        return res.status(200).json({
+            success: true,
+            importedCount,
+            totalContacts: updatedList.length,
+            contacts: updatedList,
+            message: `Successfully imported ${importedCount} contacts!`
+        });
+    } catch (err) {
+        console.error("❌ POST /api/contacts/import error:", err);
+        return res.status(500).json({ success: false, message: "Failed to import contacts.", error: err.message });
+    }
+});
+
+// Direct Google Contacts API fetch endpoint
+app.post('/api/google-contacts/fetch', async (req, res) => {
+    try {
+        const { email, accessToken } = req.body || {};
+        if (!email) {
+            return res.status(400).json({ success: false, message: "Email is required." });
+        }
+        if (!accessToken) {
+            return res.status(400).json({ success: false, message: "Google Access Token is required." });
+        }
+
+        console.log(`🌐 [Google Contacts] Fetching contacts for ${email} using Google People API...`);
+        let allContacts = [];
+        let nextPageToken = null;
+        let pageCount = 0;
+
+        do {
+            pageCount++;
+            let url = 'https://people.googleapis.com/v1/people/me/connections?personFields=names,phoneNumbers&pageSize=1000';
+            if (nextPageToken) {
+                url += `&pageToken=${encodeURIComponent(nextPageToken)}`;
+            }
+
+            const googleRes = await fetch(url, {
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Accept': 'application/json'
+                }
+            });
+
+            if (!googleRes.ok) {
+                const errText = await googleRes.text();
+                console.error("Google People API Error:", errText);
+                return res.status(googleRes.status).json({
+                    success: false,
+                    message: "Failed to fetch contacts from Google People API.",
+                    error: errText
+                });
+            }
+
+            const googleData = await googleRes.json();
+            const connections = googleData.connections || [];
+
+            for (const person of connections) {
+                const name = person.names?.[0]?.displayName || person.names?.[0]?.givenName || "";
+                const phones = person.phoneNumbers || [];
+                for (const ph of phones) {
+                    if (ph && ph.value) {
+                        allContacts.push({
+                            name: name || ph.value,
+                            number: ph.value
+                        });
+                    }
+                }
+            }
+
+            nextPageToken = googleData.nextPageToken;
+        } while (nextPageToken && pageCount < 5);
+
+        console.log(`📋 [Google Contacts] Fetched ${allContacts.length} total phone numbers from Google People API.`);
+
+        if (allContacts.length === 0) {
+            return res.status(200).json({
+                success: true,
+                importedCount: 0,
+                message: "No contacts with phone numbers found in this Google account."
+            });
+        }
+
+        const lookupEmail = email.trim();
+        let userClient = userClients[lookupEmail] || userClients[lookupEmail.toLowerCase()];
+        if (!userClient) {
+            userClient = { contactsMap: {}, contactNames: {} };
+            userClients[lookupEmail] = userClient;
+        }
+
+        if (!userClient.contactsMap) userClient.contactsMap = {};
+        if (!userClient.contactNames) userClient.contactNames = {};
+
+        const currentPhone = userClient.whatsappClient?.user?.id 
+            ? userClient.whatsappClient.user.id.split(':')[0].replace(/\D/g, '') 
+            : (userClient.currentPhone || '');
+
+        let importedCount = 0;
+        for (const item of allContacts) {
+            if (!item || !item.number) continue;
+            let rawNum = String(item.number).replace(/\D/g, '');
+            if (rawNum.startsWith('0') && rawNum.length > 10) rawNum = rawNum.replace(/^0+/, '');
+
+            if (rawNum.length >= 7 && rawNum.length <= 15) {
+                if (currentPhone && rawNum === currentPhone) continue; // Exclude own number
+
+                const jid = `${rawNum}@s.whatsapp.net`;
+                const cleanName = (item.name && String(item.name).trim()) || `+${rawNum}`;
+                userClient.contactNames[jid] = cleanName;
+                userClient.contactsMap[jid] = {
+                    id: jid,
+                    name: cleanName,
+                    notify: '',
+                    number: rawNum,
+                    isBusiness: false,
+                    isSavedContact: true
+                };
+                importedCount++;
+            }
+        }
+
+        const folderName = `auth_info_${lookupEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
+        await saveContactsToDisk(lookupEmail, folderName);
+
+        const updatedList = await getContactsForUser(userClient, lookupEmail);
+        emitToUserSockets(lookupEmail, "contacts_list", { success: true, contacts: updatedList });
+
+        return res.status(200).json({
+            success: true,
+            importedCount,
+            totalContacts: updatedList.length,
+            contacts: updatedList,
+            message: `Successfully fetched and imported ${importedCount} contacts from Google Contacts!`
+        });
+    } catch (err) {
+        console.error("❌ POST /api/google-contacts/fetch error:", err);
+        return res.status(500).json({ success: false, message: "Failed to fetch Google contacts.", error: err.message });
+    }
+});
+
 try {
-  app.use('/api', require('./routes/teamCampaign')({ userClients, emitToUserSockets }));
+  const teamCampaignRoutes = require('./routes/teamCampaignRoutes');
+  app.use('/api/team-campaign', teamCampaignRoutes);
 } catch (e) {
-  try {
-    const teamCampaignRoutes = require('./routes/teamCampaignRoutes');
-    app.use('/api/team-campaign', teamCampaignRoutes);
-  } catch (e2) {}
+  console.error("Error loading teamCampaignRoutes:", e);
 }
 
 try {

@@ -411,8 +411,8 @@ router.post('/start', async (req, res) => {
 // Async Background Dispatch Processing Engine — Round-Based Sequential Chunk Scheduler
 async function runTeamDispatchEngine(campaignId, app) {
     try {
-        const userClients = app ? app.get('userClients') : null;
-        const emitToUserSockets = app ? app.get('emitToUserSockets') : null;
+        const userClients = (app && typeof app.get === 'function' ? app.get('userClients') : null) || global.userClients || null;
+        const emitToUserSockets = (app && typeof app.get === 'function' ? app.get('emitToUserSockets') : null) || global.emitToUserSockets || null;
 
         const campaign = await TeamCampaign.findById(campaignId);
         if (!campaign) return;
@@ -475,17 +475,38 @@ async function runTeamDispatchEngine(campaignId, app) {
 
                 console.log(`[Campaign] Member ${i + 1} (${member.memberName}): sending messages ${startRange}–${endRange}`);
 
-                // Check WhatsApp session for this member (3-tier lookup: Exact -> Case-Insensitive -> Active Session Fallback)
+                // Check WhatsApp session for this member (Multi-tier lookup: Exact -> Case-Insensitive -> Leader Key -> Active Session Fallback)
                 const mEmail = (member.memberEmail || '').toLowerCase().trim();
-                let userClientObj = userClients ? userClients[member.memberEmail] : null;
-                if (!userClientObj && userClients) {
-                    const matchedKey = Object.keys(userClients).find(k => k.toLowerCase().trim() === mEmail);
-                    if (matchedKey) userClientObj = userClients[matchedKey];
+                const lEmail = (campaign.leaderEmail || '').toLowerCase().trim();
+                const isLeader = mEmail === lEmail;
+
+                let userClientObj = null;
+                if (userClients) {
+                    // 1. Direct exact key match
+                    if (member.memberEmail && userClients[member.memberEmail]) {
+                        userClientObj = userClients[member.memberEmail];
+                    }
+                    // 2. Case-insensitive / trimmed match
+                    if (!userClientObj && mEmail) {
+                        const matchedKey = Object.keys(userClients).find(k => k.toLowerCase().trim() === mEmail);
+                        if (matchedKey) userClientObj = userClients[matchedKey];
+                    }
+                    // 3. If Leader, also check campaign.leaderEmail in exact & trimmed form
+                    if (!userClientObj && isLeader && campaign.leaderEmail) {
+                        if (userClients[campaign.leaderEmail]) {
+                            userClientObj = userClients[campaign.leaderEmail];
+                        } else {
+                            const leaderKey = Object.keys(userClients).find(k => k.toLowerCase().trim() === lEmail);
+                            if (leaderKey) userClientObj = userClients[leaderKey];
+                        }
+                    }
+                    // 4. Fallback: Any active authenticated WhatsApp session
+                    if (!userClientObj) {
+                        userClientObj = Object.values(userClients).find(uc => uc && uc.isWhatsAppAuthenticated && uc.whatsappClient) || null;
+                    }
                 }
-                if (!userClientObj && userClients) {
-                    userClientObj = Object.values(userClients).find(uc => uc && uc.isWhatsAppAuthenticated) || null;
-                }
-                const isAuth = userClientObj && userClientObj.isWhatsAppAuthenticated;
+
+                const isAuth = Boolean(userClientObj && (userClientObj.isWhatsAppAuthenticated || userClientObj.whatsappClient));
                 const whatsappClient = isAuth ? userClientObj.whatsappClient : null;
 
                 let sentInChunk = 0;
@@ -500,8 +521,18 @@ async function runTeamDispatchEngine(campaignId, app) {
                     let isSuccess = false;
                     let failReason = '';
 
-                    if (whatsappClient && whatsappClient.user) {
+                    const canSend = Boolean(whatsappClient && typeof whatsappClient.sendMessage === 'function');
+
+                    if (canSend) {
                         try {
+                            // Presence handshake for reliable delivery
+                            try {
+                                if (typeof whatsappClient.sendPresenceUpdate === 'function') {
+                                    await whatsappClient.sendPresenceUpdate('composing', jid);
+                                    await new Promise(res => setTimeout(res, 500));
+                                }
+                            } catch (_) {}
+
                             if (campaign.media && campaign.media.data) {
                                 const buffer = Buffer.from(campaign.media.data, 'base64');
                                 let mime = campaign.media.mimetype ? campaign.media.mimetype.toLowerCase() : '';
@@ -523,7 +554,9 @@ async function runTeamDispatchEngine(campaignId, app) {
                             failReason = reason;
                         }
                     } else {
-                        failReason = 'Member WhatsApp session not connected or authenticated';
+                        failReason = isLeader 
+                            ? 'Leader WhatsApp session not connected. Please scan QR in dashboard.'
+                            : 'Member WhatsApp session not connected or authenticated';
                     }
 
                     if (isSuccess) {

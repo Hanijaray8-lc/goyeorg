@@ -141,6 +141,7 @@ router.put('/:id', async (req, res) => {
 
                 userUpdate = {
                     isSubscribed: true,
+                    hasEverSubscribed: true,
                     credits: 99999,
                     upcomingPlan: request.plan,
                     upcomingPlanStartsAt: upcomingStartsAt,
@@ -158,6 +159,7 @@ router.put('/:id', async (req, res) => {
 
                 userUpdate = {
                     isSubscribed: true,
+                    hasEverSubscribed: true,
                     subscriptionPlan: request.plan,
                     subscriptionStartedAt: startedAt,
                     subscriptionExpiresAt: expiresAt,
@@ -174,7 +176,9 @@ router.put('/:id', async (req, res) => {
             // Update in Subscribed Users and Free Users collection directly in MongoDB
             if (db && safeRegExp) {
                 await db.collection('users').updateMany({ email: safeRegExp }, { $set: userUpdate });
-                await db.collection('freeusers').updateMany({ email: safeRegExp }, { $set: userUpdate });
+                const freeUserUpdate = { ...userUpdate };
+                delete freeUserUpdate.credits; // Preserve free user's trial credits
+                await db.collection('freeusers').updateMany({ email: safeRegExp }, { $set: freeUserUpdate });
             }
             if (safeRegExp) {
                 try {
@@ -183,7 +187,9 @@ router.put('/:id', async (req, res) => {
                 } catch (e) {}
                 try {
                     const FreeUserMod = mongoose.models.FreeUser || mongoose.model('FreeUser');
-                    await FreeUserMod.updateMany({ email: safeRegExp }, { $set: userUpdate });
+                    const freeUserUpdate = { ...userUpdate };
+                    delete freeUserUpdate.credits; // Preserve free user's trial credits
+                    await FreeUserMod.updateMany({ email: safeRegExp }, { $set: freeUserUpdate });
                 } catch (e) {}
             }
 
