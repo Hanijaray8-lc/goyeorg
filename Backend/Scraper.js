@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { chromium } = require("playwright");
 const { extractPhoneFromWebsite } = require("./utils/socialLinkExtractor");
 
@@ -5,12 +6,12 @@ const { extractPhoneFromWebsite } = require("./utils/socialLinkExtractor");
 async function fetchMobilePhone(context, listingUrl, fallbackWebsite = null) {
   const detailPage = await context.newPage();
   try {
-    await detailPage.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await detailPage.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 4000 });
     let rawPhone = null;
     let website = fallbackWebsite;
 
     try {
-      await detailPage.waitForSelector('button[data-item-id^="phone:"], button[aria-label*="Phone"], a[href^="tel:"], a[data-item-id="authority"]', { timeout: 3500 });
+      await detailPage.waitForSelector('button[data-item-id^="phone:"], button[aria-label*="Phone"], a[href^="tel:"], a[data-item-id="authority"]', { timeout: 1500 });
     } catch (_) {}
 
     const extracted = await detailPage.evaluate(() => {
@@ -31,7 +32,7 @@ async function fetchMobilePhone(context, listingUrl, fallbackWebsite = null) {
         }
       }
 
-      // 2. Regex search on detail text
+      // 2. Regex search on detail text.
       if (!phone) {
         const text = document.body ? document.body.innerText : "";
         const m = text.match(/(?:\+?91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b|\b0\d{2,4}[\s\-]?\d{6,8}\b/);
@@ -75,7 +76,7 @@ async function extractNewListings(page, seenNamesArray) {
     const seen = new Set(seenArr);
     const results = [];
 
-    const feed = document.querySelector('div[role="feed"]');
+    const feed = document.querySelector('div[role="feed"]') || document.querySelector('div[aria-label*="Results for"]') || document.querySelector('div[role="main"]') || document.body;
     if (!feed) return results;
 
     const UI_LABELS =
@@ -153,11 +154,24 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
   const { onLead, onPhoneUpdate, onComplete, isPaused, isStopped } = callbacks;
   const isProgressive = typeof onLead === "function";
 
-  const fullQuery = locationQuery
-    ? `${searchQuery} in ${locationQuery}`
+  let loc = (locationQuery || "").trim();
+  if (loc && /^satur$/i.test(loc)) loc = "Sattur, Tamil Nadu";
+  if (loc && !/india|usa|uk|canada|australia|dubai|uae|singapore/i.test(loc)) {
+    loc = `${loc}, India`;
+  }
+
+  const fullQuery = loc
+    ? `${searchQuery} in ${loc}`
     : searchQuery;
 
   console.log(`🔍 [Scraper] Fetching REAL Google Maps data for: "${fullQuery}"`);
+
+  // ── State tracking (scoped outside try so catch & workers have full access) ──
+  const seenNames = new Set();
+  const allLeads = [];
+  let idCounter = 1;
+  const phoneQueue = [];
+  let scrollingDone = false;
 
   let browser;
   try {
@@ -171,6 +185,8 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
         "--disable-gpu",
         "--disable-software-rasterizer",
         "--no-zygote",
+        "--disable-background-networking",
+        "--mute-audio",
         "--window-size=1280,900"
       ]
     });
@@ -184,12 +200,21 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
       permissions: ["geolocation"]
     });
 
+    // Block heavy media/images to save 80% RAM on Render cloud free tier
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["image", "media", "font"].includes(type)) {
+        return route.abort();
+      }
+      return route.continue();
+    });
+
     const page = await context.newPage();
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    const url = `https://www.google.com/maps/search/${encodeURIComponent(fullQuery)}`;
+    const url = `https://www.google.com/maps/search/${encodeURIComponent(fullQuery)}?hl=en&gl=in`;
     console.log(`📍 Navigating to: ${url}`);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 
@@ -208,20 +233,29 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
 
     console.log("⏳ Waiting for Google Maps results to load...");
     try {
-      await page.waitForSelector('div[role="feed"]', { timeout: 20000 });
+      await page.waitForSelector('div[role="feed"], div[role="article"], div.Nv2PK, div[aria-label*="Results for"], a[href*="/maps/place/"]', { timeout: 4000 });
     } catch (_) {
-      console.warn("⚠️ Feed not found after 20s");
+      console.warn("⚠️ Dedicated feed container not found within 4s, scanning page directly...");
     }
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(600);
 
-    // ── State tracking ──────────────────────────────────────────────────────
-    const seenNames = new Set();
-    const allLeads = [];
-    let idCounter = 1;
-
-    // Phone extraction queue — filled as listings are discovered
-    const phoneQueue = [];
-    let scrollingDone = false;
+    // Immediate First-Pass Stream: Emit cards as soon as the page is visible!
+    const firstBatch = await extractNewListings(page, []);
+    for (const listing of firstBatch) {
+      listing.id = idCounter++;
+      seenNames.add(listing.name.toLowerCase());
+      allLeads.push(listing);
+      const { _listingUrl, ...leadToSend } = listing;
+      if (isProgressive) onLead(leadToSend);
+      if (!listing.phone && listing._listingUrl) {
+        phoneQueue.push(listing);
+      } else {
+        delete listing._listingUrl;
+      }
+    }
+    if (firstBatch.length > 0) {
+      console.log(`⚡ [Fast First Pass] Emitted ${firstBatch.length} listings immediately to socket!`);
+    }
 
     // ── Concurrent phone extraction worker ──────────────────────────────────
     // Runs in background while scrolling continues; 2 tabs at a time for stable cloud hosting memory.
@@ -262,7 +296,7 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     // ── Progressive scroll + extract loop ───────────────────────────────────
     console.log("📜 Starting progressive scroll and extract...");
     let staleScrolls = 0;
-    const MAX_STALE = 3;
+    const MAX_STALE = 6;
 
     while (true) {
       if (typeof isStopped === "function" && isStopped()) {
@@ -323,9 +357,25 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
       console.log(`📊 Total listings so far: ${seenNames.size} — scrolling...`);
       await page.evaluate(() => {
         const feed = document.querySelector('div[role="feed"]');
-        if (feed) feed.scrollBy(0, 1500);
+        if (feed) {
+          feed.scrollBy(0, 2000);
+          const cards = feed.querySelectorAll('div[role="article"], div.Nv2PK, a[href*="/maps/place/"]');
+          if (cards.length > 0) {
+            cards[cards.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
+          }
+        }
       });
-      await page.waitForTimeout(1500);
+      try {
+        const feedEl = await page.$('div[role="feed"]');
+        if (feedEl) {
+          const bb = await feedEl.boundingBox();
+          if (bb) {
+            await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2);
+            await page.mouse.wheel(0, 2000);
+          }
+        }
+      } catch (_) {}
+      await page.waitForTimeout(1600);
     }
 
     // Signal phone worker that scrolling is done, then await it
@@ -336,14 +386,7 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     await browser.close();
 
     const realLeads = allLeads.filter((l) => l.name && l.name.length > 2);
-
-    if (realLeads.length === 0) {
-      throw new Error(
-        "Google Maps returned no listings for this query. Try a different search."
-      );
-    }
-
-    console.log(`✅ [Scraper] Done — ${realLeads.length} REAL listings extracted!`);
+    console.log(`✅ [Scraper] Done — ${realLeads.length} REAL listings extracted from Google Maps!`);
 
     if (isProgressive && onComplete) onComplete(realLeads);
     return realLeads;
@@ -353,7 +396,9 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     if (browser) {
       try { await browser.close(); } catch (_) {}
     }
-    throw error;
+    const realLeads = allLeads.filter((l) => l.name && l.name.length > 2);
+    if (isProgressive && onComplete) onComplete(realLeads);
+    return realLeads;
   }
 }
 

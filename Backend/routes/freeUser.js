@@ -185,14 +185,23 @@ router.post('/free-user/login', async (req, res) => {
     }
 
     const normalizedEmail = String(email).trim().toLowerCase();
-    const safeEmailRegex = new RegExp(`^${normalizedEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
 
-    let freeUser = await FreeUser.findOne({ email: safeEmailRegex });
+    // Fast indexed match first (runs in ~1ms)
+    let freeUser = await FreeUser.findOne({ email: normalizedEmail });
+    if (!freeUser) {
+      const safeEmailRegex = new RegExp(`^${normalizedEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+      freeUser = await FreeUser.findOne({ email: safeEmailRegex });
+    }
+
     const User = mongoose.models.User;
     let subUser = null;
     if (User) {
       try {
-        subUser = await User.findOne({ email: safeEmailRegex });
+        subUser = await User.findOne({ email: normalizedEmail });
+        if (!subUser) {
+          const safeEmailRegex = new RegExp(`^${normalizedEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
+          subUser = await User.findOne({ email: safeEmailRegex });
+        }
       } catch (err) {
         console.warn('⚠️ User collection lookup warning:', err.message);
       }

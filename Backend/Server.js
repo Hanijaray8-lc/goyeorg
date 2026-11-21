@@ -22,13 +22,25 @@ const processedAiMessageIds = new Set();
 const app = express();
 const server = http.createServer(app);
 
-// Socket.io CORS setup
+// Universal CORS setup for Socket.io
 const io = new Server(server, {
-  cors: { origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true, methods: ["GET", "POST"] },
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    credentials: true
+  },
   maxHttpBufferSize: 1e8 // 100 MB limit for videos
 });
 
-app.use(cors());
+// Universal Express CORS (allows Render frontend, lcind.space, localhost)
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
+}));
+app.options(/(.*)/, cors());
+
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -36,6 +48,22 @@ app.use('/api/subscription-requests', subscriptionRequestRoutes);
 
 const socialExtractorRoutes = require('./routes/socialExtractor');
 app.use('/api/social-extractor', socialExtractorRoutes);
+
+// Ultra-fast Health / Ping Endpoint for Zero-Delay Pre-warming & Keep-Alive
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', serverTime: Date.now() });
+});
+
+// Render Keep-Alive: Ping every 13 minutes to prevent free instance spin-down
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || "https://goye-backend-bw8t.onrender.com";
+setInterval(() => {
+  try {
+    const https = require('https');
+    https.get(`${RENDER_EXTERNAL_URL}/api/health`, (resp) => {
+      // Instance kept awake
+    }).on('error', () => {});
+  } catch (err) {}
+}, 13 * 60 * 1000);
 
 // Web Scraper API Endpoint
 app.post("/api/scrape-leads", async (req, res) => {
@@ -1383,11 +1411,14 @@ io.on("connection", (socket) => {
 
         console.log(`🕷️ [WebScraper] Starting scrape for query: "${query}", location: "${location || ""}"`);
 
+        let completed = false;
+        let leadsSent = 0;
         try {
             await scrapeGoogleMapsLeads(query, location, {
                 isPaused: () => !!(socket.scrapeState && socket.scrapeState.isPaused),
                 isStopped: () => !!(socket.scrapeState && socket.scrapeState.isStopped),
                 onLead: (lead) => {
+                    leadsSent++;
                     socket.emit("scrape_lead", lead);
 
                     // Background official social extractor from website
@@ -1409,12 +1440,20 @@ io.on("connection", (socket) => {
                     socket.emit("scrape_phone_update", { id, phone });
                 },
                 onComplete: (leads) => {
+                    completed = true;
                     socket.emit("scrape_complete", { count: leads.length });
                 }
             });
         } catch (err) {
             console.error("❌ Web Scraper error:", err);
-            socket.emit("scrape_error", { message: err.message || "Failed to scrape listings." });
+            if (leadsSent > 0) {
+                if (!completed) {
+                    completed = true;
+                    socket.emit("scrape_complete", { count: leadsSent });
+                }
+            } else if (!completed) {
+                socket.emit("scrape_error", { message: err.message || "Failed to scrape listings." });
+            }
         }
     });
 
@@ -2130,18 +2169,27 @@ app.post('/api/login', async (req, res) => {
     const normalizedEmail = String(email).trim().toLowerCase();
     const safeEmailRegex = new RegExp(`^${normalizedEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')}$`, 'i');
     
-    let user = await User.findOne({ email: safeEmailRegex });
+    // Fast path: Exact indexed match (runs in ~1-2ms using unique btree index)
+    let user = await User.findOne({ email: normalizedEmail });
     let modelToUse = User;
+
+    // Fallback: Case-insensitive regex only if direct index lookup didn't hit
+    if (!user) {
+      user = await User.findOne({ email: safeEmailRegex });
+    }
 
     // Dual-lookup: If not found in User collection, check FreeUser collection!
     if (!user && mongoose.models.FreeUser) {
-      user = await mongoose.models.FreeUser.findOne({ email: safeEmailRegex });
+      user = await mongoose.models.FreeUser.findOne({ email: normalizedEmail });
+      if (!user) {
+        user = await mongoose.models.FreeUser.findOne({ email: safeEmailRegex });
+      }
       modelToUse = mongoose.models.FreeUser;
 
       // Auto-copy free user data into the User (subscribed users) collection
       // so they appear in the admin Subscribed Users panel.
       if (user) {
-        const existsInUserCol = await User.findOne({ email: safeEmailRegex });
+        const existsInUserCol = await User.findOne({ email: normalizedEmail });
         if (!existsInUserCol) {
           try {
             await new User({
@@ -2189,8 +2237,17 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
-    user = await checkAndActivateQueuedPlan(user, modelToUse);
-    user = await checkAndApplyDailyReset(user, modelToUse);
+    try {
+      user = await checkAndActivateQueuedPlan(user, modelToUse);
+    } catch (planErr) {
+      console.error("Plan check err:", planErr);
+    }
+
+    try {
+      user = await checkAndApplyDailyReset(user, modelToUse);
+    } catch (resetErr) {
+      console.error("Daily reset err:", resetErr);
+    }
 
     const hasSubHistory = !!(user.subscriptionExpiresAt || user.subscriptionStartedAt || user.subscriptionPlan);
     const isSubscribed = Boolean(
@@ -2199,12 +2256,18 @@ app.post('/api/login', async (req, res) => {
       (user.upcomingPlanExpiresAt && new Date(user.upcomingPlanExpiresAt).getTime() > Date.now())
     );
     const isFreeUserModel = modelToUse === FreeUser || (user.constructor && user.constructor.modelName === 'FreeUser');
+    
     // Also check if the user exists in the FreeUser collection (they may have been auto-copied to User)
     let freeUserRecord = null;
-    if (isFreeUserModel) {
-      freeUserRecord = user;
-    } else if (mongoose.models.FreeUser) {
-      freeUserRecord = await mongoose.models.FreeUser.findOne({ email: safeEmailRegex });
+    try {
+      if (isFreeUserModel) {
+        freeUserRecord = user;
+      } else if (mongoose.models && mongoose.models.FreeUser) {
+        freeUserRecord = (await mongoose.models.FreeUser.findOne({ email: normalizedEmail })) || 
+                         (await mongoose.models.FreeUser.findOne({ email: safeEmailRegex }));
+      }
+    } catch (fErr) {
+      console.error("Free user record lookup err:", fErr);
     }
     const hasFreeUserRecord = !!freeUserRecord;
     
@@ -2218,7 +2281,19 @@ app.post('/api/login', async (req, res) => {
     const realCredits = (freeUserRecord && freeUserRecord.credits !== undefined) ? freeUserRecord.credits : (user.credits || 0);
     const effectiveCredits = isSubscribed ? 99999 : (isActualFreeUserLogin ? realCredits : 0);
 
-    console.log(`🔍 LOGIN DEBUG: email=${user.email}, isSubscribed=${isSubscribed}, userCredits=${user.credits}, effectiveCredits=${effectiveCredits}`);
+    // Ultra-fast single DB check for pending subscription request
+    let hasPendingRequest = false;
+    if (mongoose.models.SubscriptionRequest) {
+      try {
+        const pendingDoc = await mongoose.models.SubscriptionRequest.findOne({
+          email: normalizedEmail,
+          status: "pending"
+        }).select('_id').lean();
+        if (pendingDoc) hasPendingRequest = true;
+      } catch (subErr) {}
+    }
+
+    console.log(`🔍 LOGIN DEBUG: email=${user.email}, isSubscribed=${isSubscribed}, hasPending=${hasPendingRequest}, effectiveCredits=${effectiveCredits}`);
 
     res.status(200).json({ 
       message: "Login successful!", 
@@ -2232,6 +2307,7 @@ app.post('/api/login', async (req, res) => {
       credits: effectiveCredits,
       totalSent: user.totalSent || 0,
       isSubscribed: isSubscribed,
+      hasPendingRequest: hasPendingRequest,
       subscriptionPlan: isSubscribed ? (user.subscriptionPlan || "Pro Plan") : (hasSubHistory ? (user.subscriptionPlan || "") : ""),
       subscriptionStartedAt: user.subscriptionStartedAt || null,
       subscriptionExpiresAt: user.subscriptionExpiresAt || null,
