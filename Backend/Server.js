@@ -55,7 +55,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // Render Keep-Alive: Ping every 13 minutes to prevent free instance spin-down
-const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || "https://goye-backend-bw8t.onrender.com";
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || "https://goyeorg-mije.onrender.com";
 setInterval(() => {
   try {
     const https = require('https');
