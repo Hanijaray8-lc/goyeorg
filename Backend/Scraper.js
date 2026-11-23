@@ -164,14 +164,7 @@ async function scrapeGoogleMapsLeads(searchQuery, locationQuery, callbacks = {})
     ? `${searchQuery} in ${loc}`
     : searchQuery;
 
-  // On Render Cloud Hosting: Chromium hangs or gets IP-blocked by Google Maps.
-  // Instantly use high-speed Live Cloud Engine (< 2 seconds response, 100% reliable)
-  if (process.env.RENDER || process.env.RENDER_EXTERNAL_URL) {
-    console.log(`⚡ [Scraper] Cloud Hosting detected (Render). Executing Live Directory Engine for "${fullQuery}"...`);
-    return await extractCloudVerifiedLeads(searchQuery, locationQuery, callbacks);
-  }
-
-  console.log(`🔍 [Scraper] Fetching REAL Google Maps data for: "${fullQuery}"`);
+  console.log(`🔍 [Scraper] Fetching REAL Google Maps data via Playwright Chromium for: "${fullQuery}"`);
 
   // ── State tracking (scoped outside try so catch & workers have full access) ──
   const seenNames = new Set();
