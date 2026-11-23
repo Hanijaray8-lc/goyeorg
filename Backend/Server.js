@@ -22,23 +22,48 @@ const processedAiMessageIds = new Set();
 const app = express();
 const server = http.createServer(app);
 
+// Allowed origins list including goye.in
+const allowedOrigins = [
+  "https://goye.in",
+  "http://goye.in",
+  "https://www.goye.in",
+  "http://www.goye.in",
+  "https://goyeorg.lcind.space",
+  "http://localhost:3000",
+  "http://localhost:5000",
+  "https://goyeorg-mije.onrender.com"
+];
+
 // Universal CORS setup for Socket.io
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: (origin, callback) => callback(null, true),
     methods: ["GET", "POST", "OPTIONS"],
     credentials: true
   },
   maxHttpBufferSize: 1e8 // 100 MB limit for videos
 });
 
-// Universal Express CORS (allows Render frontend, lcind.space, localhost)
+// Universal Express CORS with explicit goye.in access
 app.use(cors({
-  origin: true,
+  origin: (origin, callback) => callback(null, true),
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
 }));
+
+// Fallback headers to guarantee 100% CORS access for goye.in
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  res.header("Access-Control-Allow-Origin", origin || "*");
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 app.options(/(.*)/, cors());
 
 app.use(express.json({ limit: '100mb' }));
